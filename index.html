@@ -3,8 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Sala de Cinema — P2P Stream</title>
-  <!-- PeerJS via CDN -->
+  <title>Sala de Cinema — P2P Stream HD</title>
   <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
   <style>
     :root {
@@ -179,7 +178,7 @@
       position: absolute;
       text-align: center;
       color: var(--text-main);
-      background: rgba(0, 0, 0, 0.65);
+      background: rgba(0, 0, 0, 0.7);
       padding: 10px 18px;
       border-radius: 8px;
       pointer-events: none;
@@ -278,7 +277,7 @@
   <div id="lobby-screen">
     <div class="lobby-card">
       <h1>🍿 Sala de Cinema</h1>
-      <p>Transmita um vídeo direto do seu PC em tempo real.</p>
+      <p>Transmita um vídeo direto do seu PC em Full HD.</p>
 
       <div class="form-group">
         <label for="username-input">Seu Apelido</label>
@@ -342,7 +341,7 @@
     } from "https://www.gstatic.com/firebasejs/11.0.2/firebase-firestore.js";
 
     // =========================================================================
-    // 1. CREDENCIAIS DO FIREBASE (CONFIGURADAS)
+    // 1. CREDENCIAIS DO FIREBASE
     // =========================================================================
     const firebaseConfig = {
       apiKey: "AIzaSyB3cclEOHQbHv7J-Sa49cLTEB2eoefnKIA",
@@ -381,18 +380,39 @@
     const chatInput = document.getElementById("chat-input");
     const viewersCount = document.getElementById("viewers-count");
 
-    // Preenche código se vier por link (?sala=CINE-XXXX)
     const urlParams = new URLSearchParams(window.location.search);
     if (urlParams.get("sala")) {
       roomCodeInput.value = urlParams.get("sala").toUpperCase();
     }
 
     // =========================================================================
-    // 2. INICIALIZAÇÃO DO PEERJS (WEBRTC)
+    // 2. FORÇA ALTA TAXA DE BITS NO SDP (WEBRTC)
     // =========================================================================
+    function boostSDP(sdp) {
+      // Injeta limite de 10.000 kbps (10 Mbps) para vídeo e 256 kbps para áudio no SDP
+      let lines = sdp.split("\r\n");
+      let newLines = [];
+      for (let i = 0; i < lines.length; i++) {
+        newLines.push(lines[i]);
+        if (lines[i].startsWith("m=video")) {
+          newLines.push("b=AS:10000");
+          newLines.push("b=TIAS:10000000");
+        }
+        if (lines[i].startsWith("m=audio")) {
+          newLines.push("b=AS:256");
+        }
+        // Aumenta parâmetros de bitrate máximo nos codecs (x-google-max-bitrate)
+        if (lines[i].startsWith("a=fmtp:")) {
+          newLines[newLines.length - 1] += ";x-google-min-bitrate=4000;x-google-start-bitrate=6000;x-google-max-bitrate=10000";
+        }
+      }
+      return newLines.join("\r\n");
+    }
+
     function initPeer() {
       return new Promise((resolve, reject) => {
         peer = new Peer({
+          sdpTransform: boostSDP, // Aplica o boost de 10 Mbps direto na negociação WebRTC
           config: {
             iceServers: [
               { urls: "stun:stun.l.google.com:19302" },
@@ -445,7 +465,7 @@
         listenToChat();
       } catch (e) {
         console.error(e);
-        alert("Falha ao criar sala. Verifique sua conexão ou as regras do Firestore.");
+        alert("Falha ao criar sala.");
       }
     });
 
@@ -472,7 +492,7 @@
         await initPeer();
 
         peer.on("call", (call) => {
-          call.answer();
+          call.answer(null, { sdpTransform: boostSDP });
           call.on("stream", (remoteStream) => {
             videoEl.srcObject = remoteStream;
             videoEl.controls = true;
@@ -489,12 +509,8 @@
         });
 
         videoEl.addEventListener("click", () => {
-          if (videoEl.muted) {
-            videoEl.muted = false;
-          }
-          if (videoEl.paused) {
-            videoEl.play();
-          }
+          if (videoEl.muted) videoEl.muted = false;
+          if (videoEl.paused) videoEl.play();
           statusOverlay.style.display = "none";
         });
 
@@ -516,7 +532,7 @@
     });
 
     // =========================================================================
-    // 5. CAPTURA E TRANSMISSÃO DO VÍDEO LOCAL EM ALTA QUALIDADE (HOST)
+    // 5. CAPTURA E TRANSMISSÃO DO VÍDEO LOCAL EM FULL HD (HOST)
     // =========================================================================
     function applyHighQualityTrack(stream) {
       const videoTrack = stream.getVideoTracks()[0];
@@ -525,31 +541,62 @@
       }
     }
 
+    function preferH264Codec(pc) {
+      try {
+        const transceivers = pc.getTransceivers();
+        transceivers.forEach((transceiver) => {
+          if (transceiver.sender && transceiver.sender.track && transceiver.sender.track.kind === "video") {
+            const capabilities = RTCRtpSender.getCapabilities("video");
+            if (!capabilities) return;
+            // Coloca H264 no topo da lista para usar aceleração de hardware da placa de vídeo
+            const h264Codecs = capabilities.codecs.filter((c) => c.mimeType.toLowerCase() === "video/h264");
+            const otherCodecs = capabilities.codecs.filter((c) => c.mimeType.toLowerCase() !== "video/h264");
+            if (h264Codecs.length > 0 && transceiver.setCodecPreferences) {
+              transceiver.setCodecPreferences([...h264Codecs, ...otherCodecs]);
+            }
+          }
+        });
+      } catch (e) {
+        console.warn("Preferência de codec ignorada:", e);
+      }
+    }
+
     async function boostCallQuality(call) {
-      setTimeout(async () => {
+      const applyParams = async () => {
         try {
           const pc = call.peerConnection;
           if (!pc) return;
+          preferH264Codec(pc);
+
           const senders = pc.getSenders();
           for (const sender of senders) {
             if (sender.track && sender.track.kind === "video") {
               const params = sender.getParameters();
-              if (!params.encodings) params.encodings = [{}];
-              params.encodings[0].maxBitrate = 4500000; // 4.5 Mbps (HD/Full HD)
-              params.encodings[0].scaleResolutionDownBy = 1.0;
+              if (!params.encodings || params.encodings.length === 0) {
+                params.encodings = [{}];
+              }
+              params.encodings[0].maxBitrate = 10000000; // 10 Mbps
+              params.encodings[0].scaleResolutionDownBy = 1.0; // Resolução nativa 100%
+              params.degradationPreference = "maintain-resolution"; // Proíbe cair para 360p
               await sender.setParameters(params);
             }
             if (sender.track && sender.track.kind === "audio") {
               const params = sender.getParameters();
-              if (!params.encodings) params.encodings = [{}];
-              params.encodings[0].maxBitrate = 192000; // Áudio 192 kbps
+              if (!params.encodings || params.encodings.length === 0) {
+                params.encodings = [{}];
+              }
+              params.encodings[0].maxBitrate = 256000; // Áudio 256 kbps
               await sender.setParameters(params);
             }
           }
         } catch (err) {
-          console.warn("Ajuste de bitrate não suportado neste navegador:", err);
+          console.warn("Erro ao aplicar parâmetros HD:", err);
         }
-      }, 1500);
+      };
+
+      // Aplica imediatamente e reforça após a conexão estabilizar
+      setTimeout(applyParams, 500);
+      setTimeout(applyParams, 2500);
     }
 
     videoFileInput.addEventListener("change", (e) => {
@@ -563,16 +610,16 @@
       videoEl.onloadedmetadata = () => {
         videoEl.play();
         if (videoEl.captureStream) {
-          localStream = videoEl.captureStream(30);
+          localStream = videoEl.captureStream(); // Usa FPS nativo do arquivo
         } else if (videoEl.mozCaptureStream) {
-          localStream = videoEl.mozCaptureStream(30);
+          localStream = videoEl.mozCaptureStream();
         } else {
           return alert("Seu navegador não suporta captureStream(). Use Chrome ou Edge.");
         }
 
         applyHighQualityTrack(localStream);
         broadcastStreamToAllGuests();
-        sendSystemMessage(`🎬 Filme carregado: ${file.name}`);
+        sendSystemMessage(`🎬 Filme carregado em HD: ${file.name}`);
       };
     });
 
@@ -584,7 +631,7 @@
         if (activeCalls.has(guest.peerId)) {
           activeCalls.get(guest.peerId).close();
         }
-        const call = peer.call(guest.peerId, localStream);
+        const call = peer.call(guest.peerId, localStream, { sdpTransform: boostSDP });
         boostCallQuality(call);
         activeCalls.set(guest.peerId, call);
       });
@@ -605,7 +652,7 @@
         if (isHost && localStream) {
           guests.forEach((guest) => {
             if (!activeCalls.has(guest.peerId)) {
-              const call = peer.call(guest.peerId, localStream);
+              const call = peer.call(guest.peerId, localStream, { sdpTransform: boostSDP });
               boostCallQuality(call);
               activeCalls.set(guest.peerId, call);
             }
