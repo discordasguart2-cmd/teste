@@ -178,9 +178,12 @@
     #status-overlay {
       position: absolute;
       text-align: center;
-      color: var(--text-muted);
+      color: var(--text-main);
+      background: rgba(0, 0, 0, 0.65);
+      padding: 10px 18px;
+      border-radius: 8px;
       pointer-events: none;
-      padding: 20px;
+      font-size: 0.95rem;
     }
 
     /* Chat Lateral */
@@ -338,8 +341,8 @@
       serverTimestamp, arrayUnion
     } from "https://www.gstatic.com/firebasejs/11.0.2/firebase-firestore.js";
 
-   // =========================================================================
-    // 1. COLE AQUI AS SUAS CREDENCIAIS DO FIREBASE
+    // =========================================================================
+    // 1. CREDENCIAIS DO FIREBASE (CONFIGURADAS)
     // =========================================================================
     const firebaseConfig = {
       apiKey: "AIzaSyB3cclEOHQbHv7J-Sa49cLTEB2eoefnKIA",
@@ -361,7 +364,7 @@
     let currentUser = "";
     let isHost = false;
     let localStream = null;
-    const activeCalls = new Map(); // Guarda chamadas ativas do Host (guestPeerId -> MediaConnection)
+    const activeCalls = new Map();
 
     // Elementos DOM
     const lobbyScreen = document.getElementById("lobby-screen");
@@ -425,7 +428,6 @@
       try {
         await initPeer();
 
-        // Cria documento da sala no Firestore
         await setDoc(doc(db, "salas", currentRoomId), {
           hostPeerId: myPeerId,
           hostName: currentUser,
@@ -435,7 +437,7 @@
 
         enterCinemaUI();
         hostControls.style.display = "flex";
-        videoEl.controls = true; // Host tem controles completos
+        videoEl.controls = true;
         statusOverlay.textContent = "Clique em 'Escolher Vídeo Local' acima para iniciar a sessão.";
 
         await sendSystemMessage(`${currentUser} abriu a sala.`);
@@ -443,7 +445,7 @@
         listenToChat();
       } catch (e) {
         console.error(e);
-        alert("Falha ao criar sala. Verifique suas credenciais do Firebase.");
+        alert("Falha ao criar sala. Verifique sua conexão ou as regras do Firestore.");
       }
     });
 
@@ -469,27 +471,38 @@
 
         await initPeer();
 
-        // Prepara o convidado para receber a chamada de vídeo do Host
         peer.on("call", (call) => {
-          call.answer(); // Responde sem enviar câmera própria
+          call.answer();
           call.on("stream", (remoteStream) => {
             videoEl.srcObject = remoteStream;
-            statusOverlay.style.display = "none";
-            videoEl.play().catch(() => {
+            videoEl.controls = true;
+
+            videoEl.play().then(() => {
+              statusOverlay.style.display = "none";
+            }).catch(() => {
+              videoEl.muted = true;
+              videoEl.play();
               statusOverlay.style.display = "block";
-              statusOverlay.textContent = "Clique na tela do vídeo para liberar o áudio.";
-              videoEl.controls = true;
+              statusOverlay.textContent = "Toque no vídeo para ativar o som 🔊";
             });
           });
         });
 
-        // Registra o PeerID do convidado no Firestore para o Host ligar para ele
+        videoEl.addEventListener("click", () => {
+          if (videoEl.muted) {
+            videoEl.muted = false;
+          }
+          if (videoEl.paused) {
+            videoEl.play();
+          }
+          statusOverlay.style.display = "none";
+        });
+
         await updateDoc(roomRef, {
           guests: arrayUnion({ peerId: myPeerId, name: currentUser })
         });
 
         enterCinemaUI();
-        // Convidado só controla volume/fullscreen (clicar na tela libera autoplay com som)
         videoEl.controls = true;
         statusOverlay.textContent = "Conectado! Aguardando o Host iniciar o filme...";
 
@@ -503,8 +516,42 @@
     });
 
     // =========================================================================
-    // 5. CAPTURA E TRANSMISSÃO DO VÍDEO LOCAL (HOST)
+    // 5. CAPTURA E TRANSMISSÃO DO VÍDEO LOCAL EM ALTA QUALIDADE (HOST)
     // =========================================================================
+    function applyHighQualityTrack(stream) {
+      const videoTrack = stream.getVideoTracks()[0];
+      if (videoTrack && "contentHint" in videoTrack) {
+        videoTrack.contentHint = "detail";
+      }
+    }
+
+    async function boostCallQuality(call) {
+      setTimeout(async () => {
+        try {
+          const pc = call.peerConnection;
+          if (!pc) return;
+          const senders = pc.getSenders();
+          for (const sender of senders) {
+            if (sender.track && sender.track.kind === "video") {
+              const params = sender.getParameters();
+              if (!params.encodings) params.encodings = [{}];
+              params.encodings[0].maxBitrate = 4500000; // 4.5 Mbps (HD/Full HD)
+              params.encodings[0].scaleResolutionDownBy = 1.0;
+              await sender.setParameters(params);
+            }
+            if (sender.track && sender.track.kind === "audio") {
+              const params = sender.getParameters();
+              if (!params.encodings) params.encodings = [{}];
+              params.encodings[0].maxBitrate = 192000; // Áudio 192 kbps
+              await sender.setParameters(params);
+            }
+          }
+        } catch (err) {
+          console.warn("Ajuste de bitrate não suportado neste navegador:", err);
+        }
+      }, 1500);
+    }
+
     videoFileInput.addEventListener("change", (e) => {
       const file = e.target.files[0];
       if (!file) return;
@@ -515,16 +562,15 @@
 
       videoEl.onloadedmetadata = () => {
         videoEl.play();
-        // Captura fluxo de áudio e vídeo do elemento <video>
         if (videoEl.captureStream) {
-          localStream = videoEl.captureStream();
+          localStream = videoEl.captureStream(30);
         } else if (videoEl.mozCaptureStream) {
-          localStream = videoEl.mozCaptureStream();
+          localStream = videoEl.mozCaptureStream(30);
         } else {
           return alert("Seu navegador não suporta captureStream(). Use Chrome ou Edge.");
         }
 
-        // Envia o stream para todos os convidados já conectados
+        applyHighQualityTrack(localStream);
         broadcastStreamToAllGuests();
         sendSystemMessage(`🎬 Filme carregado: ${file.name}`);
       };
@@ -535,11 +581,11 @@
     function broadcastStreamToAllGuests() {
       if (!isHost || !localStream) return;
       currentGuestsList.forEach((guest) => {
-        // Encerra chamada antiga se houver (ex: troca de arquivo de vídeo)
         if (activeCalls.has(guest.peerId)) {
           activeCalls.get(guest.peerId).close();
         }
         const call = peer.call(guest.peerId, localStream);
+        boostCallQuality(call);
         activeCalls.set(guest.peerId, call);
       });
     }
@@ -556,11 +602,11 @@
 
         viewersCount.textContent = `${guests.length + 1} online`;
 
-        // Se sou Host e já tenho um vídeo rodando, ligo para novos convidados
         if (isHost && localStream) {
           guests.forEach((guest) => {
             if (!activeCalls.has(guest.peerId)) {
               const call = peer.call(guest.peerId, localStream);
+              boostCallQuality(call);
               activeCalls.set(guest.peerId, call);
             }
           });
@@ -623,7 +669,6 @@
       cinemaScreen.style.display = "grid";
       displayRoomCode.textContent = currentRoomId;
 
-      // Atualiza URL para facilitar compartilhamento
       const newUrl = `${window.location.origin}${window.location.pathname}?sala=${currentRoomId}`;
       window.history.replaceState({}, "", newUrl);
     }
@@ -642,4 +687,4 @@
     }
   </script>
 </body>
-</html>v
+</html>
