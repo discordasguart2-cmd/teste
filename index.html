@@ -1,0 +1,645 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Sala de Cinema — P2P Stream</title>
+  <!-- PeerJS via CDN -->
+  <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+  <style>
+    :root {
+      --bg-dark: #09090b;
+      --bg-panel: #121216;
+      --bg-input: #1c1c22;
+      --border: #27272f;
+      --accent: #e11d48;
+      --accent-hover: #be123c;
+      --text-main: #f4f4f5;
+      --text-muted: #a1a1aa;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', system-ui, sans-serif; }
+
+    body {
+      background-color: var(--bg-dark);
+      color: var(--text-main);
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    /* Tela Inicial / Lobby */
+    #lobby-screen {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+
+    .lobby-card {
+      background: var(--bg-panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 32px;
+      width: 100%;
+      max-width: 420px;
+      box-shadow: 0 20px 50px rgba(0,0,0,0.7);
+    }
+
+    .lobby-card h1 { font-size: 1.5rem; margin-bottom: 6px; }
+    .lobby-card p { color: var(--text-muted); font-size: 0.9rem; margin-bottom: 24px; }
+
+    .form-group { margin-bottom: 16px; }
+    .form-group label { display: block; font-size: 0.85rem; color: var(--text-muted); margin-bottom: 6px; }
+    .form-group input {
+      width: 100%;
+      padding: 10px 12px;
+      background: var(--bg-input);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text-main);
+      font-size: 0.95rem;
+    }
+    .form-group input:focus { outline: none; border-color: var(--accent); }
+
+    .btn {
+      width: 100%;
+      padding: 12px;
+      border: none;
+      border-radius: 8px;
+      font-weight: 600;
+      font-size: 0.95rem;
+      cursor: pointer;
+      transition: 0.2s;
+    }
+    .btn-primary { background: var(--accent); color: white; }
+    .btn-primary:hover { background: var(--accent-hover); }
+    .btn-secondary { background: var(--bg-input); color: var(--text-main); border: 1px solid var(--border); }
+    .btn-secondary:hover { background: #272730; }
+
+    .divider {
+      text-align: center;
+      margin: 20px 0;
+      color: var(--text-muted);
+      font-size: 0.8rem;
+      position: relative;
+    }
+    .divider::before, .divider::after {
+      content: "";
+      position: absolute;
+      top: 50%;
+      width: 40%;
+      height: 1px;
+      background: var(--border);
+    }
+    .divider::before { left: 0; }
+    .divider::after { right: 0; }
+
+    /* Tela da Sala de Cinema */
+    #cinema-screen {
+      display: none;
+      flex: 1;
+      height: 100vh;
+      grid-template-columns: 1fr 340px;
+    }
+
+    /* Área do Vídeo */
+    .stage {
+      display: flex;
+      flex-direction: column;
+      background: #000;
+      position: relative;
+    }
+
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 20px;
+      background: var(--bg-panel);
+      border-bottom: 1px solid var(--border);
+      gap: 12px;
+    }
+
+    .room-badge {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 0.9rem;
+    }
+    .room-code {
+      background: var(--bg-input);
+      padding: 4px 10px;
+      border-radius: 6px;
+      font-family: monospace;
+      font-weight: bold;
+      color: var(--accent);
+      border: 1px solid var(--border);
+      cursor: pointer;
+    }
+
+    .host-controls {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .file-label {
+      background: var(--accent);
+      color: white;
+      padding: 8px 14px;
+      border-radius: 6px;
+      font-size: 0.85rem;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .file-label:hover { background: var(--accent-hover); }
+    #video-file-input { display: none; }
+
+    .video-container {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      position: relative;
+      overflow: hidden;
+    }
+
+    video {
+      width: 100%;
+      height: 100%;
+      max-height: calc(100vh - 58px);
+      object-fit: contain;
+      background: #000;
+    }
+
+    #status-overlay {
+      position: absolute;
+      text-align: center;
+      color: var(--text-muted);
+      pointer-events: none;
+      padding: 20px;
+    }
+
+    /* Chat Lateral */
+    .sidebar {
+      background: var(--bg-panel);
+      border-left: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+    }
+
+    .sidebar-header {
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--border);
+      font-weight: 600;
+      font-size: 0.95rem;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .viewers-count {
+      font-size: 0.8rem;
+      color: var(--text-muted);
+      font-weight: normal;
+    }
+
+    .chat-messages {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .msg {
+      background: var(--bg-input);
+      padding: 8px 12px;
+      border-radius: 8px;
+      font-size: 0.9rem;
+      line-height: 1.4;
+      word-wrap: break-word;
+    }
+    .msg-author {
+      font-size: 0.75rem;
+      font-weight: 700;
+      color: var(--accent);
+      margin-bottom: 2px;
+    }
+    .msg-system {
+      font-size: 0.8rem;
+      color: var(--text-muted);
+      text-align: center;
+      font-style: italic;
+    }
+
+    .chat-form {
+      padding: 12px;
+      border-top: 1px solid var(--border);
+      display: flex;
+      gap: 8px;
+    }
+    .chat-form input {
+      flex: 1;
+      padding: 10px;
+      background: var(--bg-input);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text-main);
+    }
+    .chat-form input:focus { outline: none; border-color: var(--accent); }
+    .chat-form button {
+      padding: 0 16px;
+      background: var(--accent);
+      border: none;
+      border-radius: 6px;
+      color: white;
+      font-weight: 600;
+      cursor: pointer;
+    }
+
+    @media (max-width: 850px) {
+      #cinema-screen { grid-template-columns: 1fr; grid-template-rows: 55vh 45vh; }
+      .sidebar { height: 45vh; border-left: none; border-top: 1px solid var(--border); }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- TELA 1: LOBBY -->
+  <div id="lobby-screen">
+    <div class="lobby-card">
+      <h1>🍿 Sala de Cinema</h1>
+      <p>Transmita um vídeo direto do seu PC em tempo real.</p>
+
+      <div class="form-group">
+        <label for="username-input">Seu Apelido</label>
+        <input type="text" id="username-input" placeholder="Ex: Pedro" maxlength="20" />
+      </div>
+
+      <button class="btn btn-primary" id="create-room-btn">Criar Nova Sala (Host)</button>
+
+      <div class="divider">OU ENTRE NUMA SALA</div>
+
+      <div class="form-group">
+        <label for="room-code-input">Código da Sala</label>
+        <input type="text" id="room-code-input" placeholder="Ex: CINE-4821" style="text-transform: uppercase;" />
+      </div>
+
+      <button class="btn btn-secondary" id="join-room-btn">Entrar como Convidado</button>
+    </div>
+  </div>
+
+  <!-- TELA 2: CINEMA -->
+  <div id="cinema-screen">
+    <div class="stage">
+      <div class="topbar">
+        <div class="room-badge">
+          <span>Sala:</span>
+          <span class="room-code" id="display-room-code" title="Clique para copiar">---</span>
+        </div>
+
+        <div class="host-controls" id="host-controls" style="display: none;">
+          <label for="video-file-input" class="file-label">📁 Escolher Vídeo Local</label>
+          <input type="file" id="video-file-input" accept="video/mp4,video/webm,video/ogg,video/x-matroska" />
+        </div>
+      </div>
+
+      <div class="video-container">
+        <div id="status-overlay">Aguardando vídeo ser carregado...</div>
+        <video id="cinema-video" playsinline></video>
+      </div>
+    </div>
+
+    <div class="sidebar">
+      <div class="sidebar-header">
+        <span>Chat da Sessão</span>
+        <span class="viewers-count" id="viewers-count">1 online</span>
+      </div>
+      <div class="chat-messages" id="chat-messages"></div>
+      <form class="chat-form" id="chat-form">
+        <input type="text" id="chat-input" placeholder="Enviar mensagem..." autocomplete="off" />
+        <button type="submit">Enviar</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- Firebase Modular SDK (v11) -->
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/11.0.2/firebase-app.js";
+    import {
+      getFirestore, doc, setDoc, getDoc, updateDoc,
+      collection, addDoc, onSnapshot, query, orderBy,
+      serverTimestamp, arrayUnion
+    } from "https://www.gstatic.com/firebasejs/11.0.2/firebase-firestore.js";
+
+   // =========================================================================
+    // 1. COLE AQUI AS SUAS CREDENCIAIS DO FIREBASE
+    // =========================================================================
+    const firebaseConfig = {
+      apiKey: "AIzaSyB3cclEOHQbHv7J-Sa49cLTEB2eoefnKIA",
+      authDomain: "sala-b91fa.firebaseapp.com",
+      projectId: "sala-b91fa",
+      storageBucket: "sala-b91fa.firebasestorage.app",
+      messagingSenderId: "460079159474",
+      appId: "1:460079159474:web:c0b6b5c0d14acd9e8c51ab",
+      measurementId: "G-QB5V3X0N1H"
+    };
+
+    const app = initializeApp(firebaseConfig);
+    const db = getFirestore(app);
+
+    // Variáveis de Estado
+    let peer = null;
+    let myPeerId = null;
+    let currentRoomId = null;
+    let currentUser = "";
+    let isHost = false;
+    let localStream = null;
+    const activeCalls = new Map(); // Guarda chamadas ativas do Host (guestPeerId -> MediaConnection)
+
+    // Elementos DOM
+    const lobbyScreen = document.getElementById("lobby-screen");
+    const cinemaScreen = document.getElementById("cinema-screen");
+    const usernameInput = document.getElementById("username-input");
+    const roomCodeInput = document.getElementById("room-code-input");
+    const displayRoomCode = document.getElementById("display-room-code");
+    const hostControls = document.getElementById("host-controls");
+    const videoFileInput = document.getElementById("video-file-input");
+    const videoEl = document.getElementById("cinema-video");
+    const statusOverlay = document.getElementById("status-overlay");
+    const chatMessages = document.getElementById("chat-messages");
+    const chatForm = document.getElementById("chat-form");
+    const chatInput = document.getElementById("chat-input");
+    const viewersCount = document.getElementById("viewers-count");
+
+    // Preenche código se vier por link (?sala=CINE-XXXX)
+    const urlParams = new URLSearchParams(window.location.search);
+    if (urlParams.get("sala")) {
+      roomCodeInput.value = urlParams.get("sala").toUpperCase();
+    }
+
+    // =========================================================================
+    // 2. INICIALIZAÇÃO DO PEERJS (WEBRTC)
+    // =========================================================================
+    function initPeer() {
+      return new Promise((resolve, reject) => {
+        peer = new Peer({
+          config: {
+            iceServers: [
+              { urls: "stun:stun.l.google.com:19302" },
+              { urls: "stun:stun1.l.google.com:19302" }
+            ]
+          }
+        });
+
+        peer.on("open", (id) => {
+          myPeerId = id;
+          resolve(id);
+        });
+
+        peer.on("error", (err) => {
+          console.error("Erro PeerJS:", err);
+          alert("Erro de conexão P2P: " + err.type);
+          reject(err);
+        });
+      });
+    }
+
+    // =========================================================================
+    // 3. CRIAR SALA (HOST)
+    // =========================================================================
+    document.getElementById("create-room-btn").addEventListener("click", async () => {
+      const name = usernameInput.value.trim();
+      if (!name) return alert("Digite seu apelido primeiro.");
+
+      currentUser = name;
+      isHost = true;
+      currentRoomId = "CINE-" + Math.floor(1000 + Math.random() * 9000);
+
+      try {
+        await initPeer();
+
+        // Cria documento da sala no Firestore
+        await setDoc(doc(db, "salas", currentRoomId), {
+          hostPeerId: myPeerId,
+          hostName: currentUser,
+          guests: [],
+          createdAt: serverTimestamp()
+        });
+
+        enterCinemaUI();
+        hostControls.style.display = "flex";
+        videoEl.controls = true; // Host tem controles completos
+        statusOverlay.textContent = "Clique em 'Escolher Vídeo Local' acima para iniciar a sessão.";
+
+        await sendSystemMessage(`${currentUser} abriu a sala.`);
+        listenToRoomChanges();
+        listenToChat();
+      } catch (e) {
+        console.error(e);
+        alert("Falha ao criar sala. Verifique suas credenciais do Firebase.");
+      }
+    });
+
+    // =========================================================================
+    // 4. ENTRAR NA SALA (CONVIDADO)
+    // =========================================================================
+    document.getElementById("join-room-btn").addEventListener("click", async () => {
+      const name = usernameInput.value.trim();
+      const code = roomCodeInput.value.trim().toUpperCase();
+      if (!name || !code) return alert("Preencha seu apelido e o código da sala.");
+
+      currentUser = name;
+      isHost = false;
+      currentRoomId = code;
+
+      try {
+        const roomRef = doc(db, "salas", currentRoomId);
+        const roomSnap = await getDoc(roomRef);
+
+        if (!roomSnap.exists()) {
+          return alert("Sala não encontrada! Verifique o código.");
+        }
+
+        await initPeer();
+
+        // Prepara o convidado para receber a chamada de vídeo do Host
+        peer.on("call", (call) => {
+          call.answer(); // Responde sem enviar câmera própria
+          call.on("stream", (remoteStream) => {
+            videoEl.srcObject = remoteStream;
+            statusOverlay.style.display = "none";
+            videoEl.play().catch(() => {
+              statusOverlay.style.display = "block";
+              statusOverlay.textContent = "Clique na tela do vídeo para liberar o áudio.";
+              videoEl.controls = true;
+            });
+          });
+        });
+
+        // Registra o PeerID do convidado no Firestore para o Host ligar para ele
+        await updateDoc(roomRef, {
+          guests: arrayUnion({ peerId: myPeerId, name: currentUser })
+        });
+
+        enterCinemaUI();
+        // Convidado só controla volume/fullscreen (clicar na tela libera autoplay com som)
+        videoEl.controls = true;
+        statusOverlay.textContent = "Conectado! Aguardando o Host iniciar o filme...";
+
+        await sendSystemMessage(`${currentUser} entrou na sala.`);
+        listenToRoomChanges();
+        listenToChat();
+      } catch (e) {
+        console.error(e);
+        alert("Erro ao entrar na sala.");
+      }
+    });
+
+    // =========================================================================
+    // 5. CAPTURA E TRANSMISSÃO DO VÍDEO LOCAL (HOST)
+    // =========================================================================
+    videoFileInput.addEventListener("change", (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+
+      const fileURL = URL.createObjectURL(file);
+      videoEl.src = fileURL;
+      statusOverlay.style.display = "none";
+
+      videoEl.onloadedmetadata = () => {
+        videoEl.play();
+        // Captura fluxo de áudio e vídeo do elemento <video>
+        if (videoEl.captureStream) {
+          localStream = videoEl.captureStream();
+        } else if (videoEl.mozCaptureStream) {
+          localStream = videoEl.mozCaptureStream();
+        } else {
+          return alert("Seu navegador não suporta captureStream(). Use Chrome ou Edge.");
+        }
+
+        // Envia o stream para todos os convidados já conectados
+        broadcastStreamToAllGuests();
+        sendSystemMessage(`🎬 Filme carregado: ${file.name}`);
+      };
+    });
+
+    let currentGuestsList = [];
+
+    function broadcastStreamToAllGuests() {
+      if (!isHost || !localStream) return;
+      currentGuestsList.forEach((guest) => {
+        // Encerra chamada antiga se houver (ex: troca de arquivo de vídeo)
+        if (activeCalls.has(guest.peerId)) {
+          activeCalls.get(guest.peerId).close();
+        }
+        const call = peer.call(guest.peerId, localStream);
+        activeCalls.set(guest.peerId, call);
+      });
+    }
+
+    // =========================================================================
+    // 6. SINCRONIZAÇÃO FIRESTORE (SALA E CHAT)
+    // =========================================================================
+    function listenToRoomChanges() {
+      onSnapshot(doc(db, "salas", currentRoomId), (snapshot) => {
+        if (!snapshot.exists()) return;
+        const data = snapshot.data();
+        const guests = data.guests || [];
+        currentGuestsList = guests;
+
+        viewersCount.textContent = `${guests.length + 1} online`;
+
+        // Se sou Host e já tenho um vídeo rodando, ligo para novos convidados
+        if (isHost && localStream) {
+          guests.forEach((guest) => {
+            if (!activeCalls.has(guest.peerId)) {
+              const call = peer.call(guest.peerId, localStream);
+              activeCalls.set(guest.peerId, call);
+            }
+          });
+        }
+      });
+    }
+
+    function listenToChat() {
+      const q = query(
+        collection(db, "salas", currentRoomId, "mensagens"),
+        orderBy("createdAt", "asc")
+      );
+
+      onSnapshot(q, (snapshot) => {
+        chatMessages.innerHTML = "";
+        snapshot.forEach((docSnap) => {
+          const msg = docSnap.data();
+          const div = document.createElement("div");
+
+          if (msg.system) {
+            div.className = "msg-system";
+            div.textContent = msg.text;
+          } else {
+            div.className = "msg";
+            div.innerHTML = `<div class="msg-author">${escapeHTML(msg.author)}</div><div>${escapeHTML(msg.text)}</div>`;
+          }
+          chatMessages.appendChild(div);
+        });
+        chatMessages.scrollTop = chatMessages.scrollHeight;
+      });
+    }
+
+    chatForm.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const text = chatInput.value.trim();
+      if (!text || !currentRoomId) return;
+
+      chatInput.value = "";
+      await addDoc(collection(db, "salas", currentRoomId, "mensagens"), {
+        author: currentUser,
+        text: text,
+        system: false,
+        createdAt: serverTimestamp()
+      });
+    });
+
+    async function sendSystemMessage(text) {
+      await addDoc(collection(db, "salas", currentRoomId, "mensagens"), {
+        text: text,
+        system: true,
+        createdAt: serverTimestamp()
+      });
+    }
+
+    // =========================================================================
+    // 7. UTILITÁRIOS DE INTERFACE
+    // =========================================================================
+    function enterCinemaUI() {
+      lobbyScreen.style.display = "none";
+      cinemaScreen.style.display = "grid";
+      displayRoomCode.textContent = currentRoomId;
+
+      // Atualiza URL para facilitar compartilhamento
+      const newUrl = `${window.location.origin}${window.location.pathname}?sala=${currentRoomId}`;
+      window.history.replaceState({}, "", newUrl);
+    }
+
+    displayRoomCode.addEventListener("click", () => {
+      navigator.clipboard.writeText(window.location.href);
+      const original = displayRoomCode.textContent;
+      displayRoomCode.textContent = "Link Copiado!";
+      setTimeout(() => (displayRoomCode.textContent = original), 1500);
+    });
+
+    function escapeHTML(str) {
+      return str.replace(/[&<>"']/g, (m) => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+      }[m]));
+    }
+  </script>
+</body>
+</html>v
