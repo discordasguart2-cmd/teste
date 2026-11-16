@@ -3,8 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Sala de Cinema — Bitrate Original (MSE + P2P)</title>
-  <!-- PeerJS & MP4Box.js via CDN -->
+  <title>Sala de Cinema — P2P Stream Original (Estabilizado)</title>
   <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/mp4box@0.5.2/dist/mp4box.all.min.js"></script>
   <style>
@@ -191,7 +190,7 @@
       position: absolute;
       text-align: center;
       color: var(--text-main);
-      background: rgba(0, 0, 0, 0.78);
+      background: rgba(0, 0, 0, 0.8);
       padding: 12px 20px;
       border-radius: 8px;
       pointer-events: none;
@@ -295,7 +294,7 @@
 
       <div class="form-group">
         <label for="username-input">Seu Apelido</label>
-        <input type="text" id="username-input" placeholder="Ex: Pedro" maxlength="20" />
+        <input type="text" id="username-input" placeholder="Ex: Sentinela" maxlength="20" />
       </div>
 
       <button class="btn btn-primary" id="create-room-btn">Criar Nova Sala (Host)</button>
@@ -371,6 +370,10 @@
     const app = initializeApp(firebaseConfig);
     const db = getFirestore(app);
 
+    // Constantes de Controle de Vazão WebRTC (Evita engasgo no Wi-Fi)
+    const PACKET_SIZE = 64 * 1024; // 64 KB por pacote
+    const MAX_BUFFERED_AMOUNT = 512 * 1024; // Pausa envio se fila passar de 512 KB
+
     // Variáveis de Estado Geral
     let peer = null;
     let myPeerId = null;
@@ -378,18 +381,23 @@
     let currentUser = "";
     let isHost = false;
 
-    // Variáveis do Host (Segmentação MP4Box em Memória/Disco Local)
+    // Variáveis do Host
     let mediaReady = false;
-    let mediaMeta = null; // { duration, tracks: [{ id, codec, mime, initBuffer, segments: [{ index, time, duration, buffer }] }] }
-    const guestConnections = new Map(); // guestPeerId -> DataConnection
+    let mediaMeta = null;
+    const guestConnections = new Map();
+    const guestSendQueues = new Map(); // guestPeerId -> Array<Function>
+    const guestSendingFlags = new Map();
 
-    // Variáveis do Convidado (MediaSource Extensions)
+    // Variáveis do Convidado (MSE + Reassembly + GC)
     let hostConnection = null;
     let mediaSource = null;
-    let sourceBuffers = {}; // trackId -> SourceBuffer
-    let appendQueues = {};  // trackId -> Array<ArrayBuffer>
-    let guestTrackMeta = {}; // trackId -> { totalSegments, nextSegmentToRequest, duration }
-    let isSyncingFromHost = false;
+    let sourceBuffers = {};
+    let appendQueues = {};
+    let guestTrackMeta = {};
+    let inFlightRequests = {}; // trackId -> Set<segIndex>
+    let incomingChunks = {};   // `${trackId}_${segIndex}` -> { total, received, parts[] }
+    let currentSeekEpoch = 0;  // Ignora pacotes atrasados de antes de um seek
+    let lastKnownHostTime = -1;
 
     // Elementos DOM
     const lobbyScreen = document.getElementById("lobby-screen");
@@ -415,7 +423,7 @@
     }
 
     // =========================================================================
-    // 2. INICIALIZAÇÃO DO PEERJS (CANAL DE DADOS BINÁRIOS)
+    // 2. INICIALIZAÇÃO DO PEERJS
     // =========================================================================
     function initPeer() {
       return new Promise((resolve, reject) => {
@@ -450,7 +458,7 @@
     }
 
     // =========================================================================
-    // 3. HOST: CRIAR SALA E SERVIR SEGMENTOS ORIGINAIS
+    // 3. HOST: CRIAR SALA E ENVIAR PACOTES FATIADOS COM CONTROLE DE VAZÃO
     // =========================================================================
     createRoomBtn.addEventListener("click", async () => {
       const name = usernameInput.value.trim();
@@ -466,9 +474,10 @@
       try {
         await initPeer();
 
-        // Escuta conexões de dados dos convidados
         peer.on("connection", (conn) => {
           guestConnections.set(conn.peer, conn);
+          guestSendQueues.set(conn.peer, []);
+          guestSendingFlags.set(conn.peer, false);
           updateOnlineCount();
 
           conn.on("open", () => {
@@ -478,13 +487,19 @@
           });
 
           conn.on("data", (msg) => {
-            if (msg && msg.type === "REQ_SEGMENT") {
-              sendSegmentToGuest(conn, msg.trackId, msg.segIndex);
+            if (!msg) return;
+            if (msg.type === "REQ_SEGMENT") {
+              enqueueSegmentForGuest(conn, msg.trackId, msg.segIndex, msg.epoch);
+            } else if (msg.type === "CLEAR_QUEUE") {
+              // Limpa pacotes pendentes antigos quando o convidado dá seek
+              guestSendQueues.set(conn.peer, []);
             }
           });
 
           conn.on("close", () => {
             guestConnections.delete(conn.peer);
+            guestSendQueues.delete(conn.peer);
+            guestSendingFlags.delete(conn.peer);
             updateOnlineCount();
           });
         });
@@ -492,14 +507,14 @@
         await setDoc(doc(db, "salas", currentRoomId), {
           hostPeerId: myPeerId,
           hostName: currentUser,
-          playback: { isPlaying: false, currentTime: 0, updatedAt: Date.now() },
+          playback: { isPlaying: false, currentTime: 0, seekId: 0, updatedAt: Date.now() },
           createdAt: serverTimestamp()
         });
 
         enterCinemaUI();
         hostControls.style.display = "flex";
         videoEl.controls = true;
-        statusOverlay.textContent = "Clique em 'Escolher Vídeo (.mp4)' acima para preparar o streaming original.";
+        statusOverlay.textContent = "Clique em 'Escolher Vídeo (.mp4)' acima para iniciar.";
 
         setupHostPlaybackSync();
         await sendSystemMessage(`${currentUser} abriu a sala.`);
@@ -516,15 +531,12 @@
       viewersCount.textContent = `${guestConnections.size + 1} online`;
     }
 
-    // Fragmenta o arquivo MP4 local sem perder qualidade usando MP4Box.js
     videoFileInput.addEventListener("change", async (e) => {
       const file = e.target.files[0];
       if (!file) return;
 
       statusOverlay.style.display = "block";
-      statusOverlay.textContent = "Indexando faixas de vídeo e áudio original (aguarde)...";
-
-      // Toca localmente direto do disco para o Host
+      statusOverlay.textContent = "Indexando faixas originais (aguarde)...";
       videoEl.src = URL.createObjectURL(file);
 
       try {
@@ -539,15 +551,15 @@
         statusOverlay.style.display = "none";
         await videoEl.play();
 
-        // Envia o manifesto inicial para todos os convidados já conectados
         guestConnections.forEach((conn) => {
+          guestSendQueues.set(conn.peer, []);
           if (conn.open) sendInitManifestToGuest(conn);
         });
 
-        sendSystemMessage(`🎬 Filme pronto em qualidade original: ${file.name}`);
+        sendSystemMessage(`🎬 Filme carregado em qualidade original: ${file.name}`);
       } catch (err) {
         console.error(err);
-        statusOverlay.textContent = "Erro ao ler MP4. Certifique-se de que o arquivo é .mp4 (H.264 + AAC).";
+        statusOverlay.textContent = "Erro ao ler MP4. Use um arquivo .mp4 (H.264 + AAC).";
       }
     });
 
@@ -563,7 +575,6 @@
           movieDuration = info.duration / info.timescale;
 
           info.tracks.forEach((track) => {
-            // Seleciona apenas vídeo e áudio principal
             if (track.type !== "video" && track.type !== "audio") return;
 
             const mime = track.type === "video"
@@ -576,13 +587,12 @@
               mime: mime,
               width: track.video ? track.video.width : 0,
               height: track.video ? track.video.height : 0,
-              timescale: track.timescale,
               initBuffer: null,
               segments: []
             };
 
-            // Gera segmentos de ~2 segundos (50 amostras por segmento)
-            mp4boxfile.setSegmentOptions(track.id, null, { nbSamples: 50 });
+            // Segmentos menores (~1.5s / 36 frames) para resposta rápida no Wi-Fi
+            mp4boxfile.setSegmentOptions(track.id, null, { nbSamples: 36 });
           });
 
           const initSegs = mp4boxfile.initializeSegmentation();
@@ -595,17 +605,15 @@
           mp4boxfile.start();
         };
 
-        mp4boxfile.onSegment = (id, user, buffer, sampleNumber, last) => {
+        mp4boxfile.onSegment = (id, user, buffer) => {
           const track = tracksMap[id];
           if (!track) return;
-
           track.segments.push({
             index: track.segments.length,
             buffer: buffer
           });
         };
 
-        // Lê o arquivo do disco em blocos de 2 MB para não travar o navegador
         const chunkSize = 2 * 1024 * 1024;
         let offset = 0;
         const reader = new FileReader();
@@ -624,26 +632,20 @@
             if (validTracks.length === 0) {
               return reject(new Error("Nenhuma faixa compatível encontrada."));
             }
-            resolve({
-              duration: movieDuration,
-              tracks: validTracks
-            });
+            resolve({ duration: movieDuration, tracks: validTracks });
           }
         };
 
         reader.onerror = (err) => reject(err);
-
         function readNextChunk() {
-          const slice = file.slice(offset, offset + chunkSize);
-          reader.readAsArrayBuffer(slice);
+          reader.readAsArrayBuffer(file.slice(offset, offset + chunkSize));
         }
-
         readNextChunk();
       });
     }
 
     function sendInitManifestToGuest(conn) {
-      const manifest = {
+      conn.send({
         type: "INIT_MANIFEST",
         duration: mediaMeta.duration,
         tracks: mediaMeta.tracks.map((t) => ({
@@ -655,43 +657,99 @@
           totalSegments: t.segments.length,
           initBuffer: t.initBuffer
         }))
-      };
-      conn.send(manifest);
+      });
     }
 
-    function sendSegmentToGuest(conn, trackId, segIndex) {
+    // Fatia cada segmento em pacotes de 64 KB e respeita o limite de buffer da rede
+    function enqueueSegmentForGuest(conn, trackId, segIndex, epoch) {
       if (!mediaMeta) return;
       const track = mediaMeta.tracks.find((t) => t.id === trackId);
       if (!track || !track.segments[segIndex]) return;
 
-      conn.send({
-        type: "SEGMENT_DATA",
-        trackId: trackId,
-        segIndex: segIndex,
-        buffer: track.segments[segIndex].buffer
-      });
+      const fullBuffer = track.segments[segIndex].buffer;
+      const totalParts = Math.ceil(fullBuffer.byteLength / PACKET_SIZE);
+      const queue = guestSendQueues.get(conn.peer);
+      if (!queue) return;
+
+      for (let partIdx = 0; partIdx < totalParts; partIdx++) {
+        const start = partIdx * PACKET_SIZE;
+        const end = Math.min(start + PACKET_SIZE, fullBuffer.byteLength);
+        const slice = fullBuffer.slice(start, end);
+
+        queue.push({
+          type: "SEGMENT_CHUNK",
+          trackId: trackId,
+          segIndex: segIndex,
+          epoch: epoch,
+          partIdx: partIdx,
+          totalParts: totalParts,
+          chunk: slice
+        });
+      }
+
+      drainGuestSendQueue(conn);
     }
 
-    // Sincroniza Play / Pause / Seek do Host no Firestore
+    function drainGuestSendQueue(conn) {
+      if (!conn || !conn.open) return;
+      if (guestSendingFlags.get(conn.peer)) return;
+
+      const queue = guestSendQueues.get(conn.peer);
+      if (!queue || queue.length === 0) return;
+
+      guestSendingFlags.set(conn.peer, true);
+
+      const pump = () => {
+        if (!conn.open) {
+          guestSendingFlags.set(conn.peer, false);
+          return;
+        }
+
+        const dc = conn.dataChannel;
+        while (queue.length > 0) {
+          // Se o buffer do WebRTC passou de 512 KB, espera 15ms antes de mandar mais
+          if (dc && dc.bufferedAmount > MAX_BUFFERED_AMOUNT) {
+            setTimeout(pump, 15);
+            return;
+          }
+          const packet = queue.shift();
+          try {
+            conn.send(packet);
+          } catch (e) {
+            console.warn("Erro no envio P2P:", e);
+            break;
+          }
+        }
+
+        guestSendingFlags.set(conn.peer, false);
+      };
+
+      pump();
+    }
+
     function setupHostPlaybackSync() {
       const roomRef = doc(db, "salas", currentRoomId);
-      const syncState = () => {
+      let seekCounter = 0;
+
+      const syncState = (isSeek = false) => {
+        if (isSeek) seekCounter++;
         updateDoc(roomRef, {
           playback: {
             isPlaying: !videoEl.paused,
             currentTime: videoEl.currentTime,
+            seekId: seekCounter,
             updatedAt: Date.now()
           }
         }).catch(() => {});
       };
 
-      videoEl.addEventListener("play", syncState);
-      videoEl.addEventListener("pause", syncState);
-      videoEl.addEventListener("seeked", syncState);
+      videoEl.addEventListener("play", () => syncState(false));
+      videoEl.addEventListener("pause", () => syncState(false));
+      videoEl.addEventListener("seeked", () => syncState(true));
     }
 
     // =========================================================================
-    // 4. CONVIDADO: RECEBER BYTES ORIGINAIS E MONTAR VIA MEDIASOURCE (MSE)
+    // 4. CONVIDADO: REMONTAGEM DE PACOTES + RESET NO SEEK + LIMPEZA DE RAM
     // =========================================================================
     joinRoomBtn.addEventListener("click", async () => {
       const name = usernameInput.value.trim();
@@ -723,7 +781,7 @@
         hostConnection.on("open", () => {
           enterCinemaUI();
           videoEl.controls = true;
-          statusOverlay.textContent = "Conectado ao Host! Aguardando o filme iniciar...";
+          statusOverlay.textContent = "Conectado! Aguardando o Host iniciar o filme...";
           sendSystemMessage(`${currentUser} entrou na sala.`);
           listenToHostPlayback();
           listenToChat();
@@ -733,8 +791,8 @@
           if (!msg || !msg.type) return;
           if (msg.type === "INIT_MANIFEST") {
             initGuestMediaSource(msg);
-          } else if (msg.type === "SEGMENT_DATA") {
-            enqueueSegmentBuffer(msg.trackId, msg.segIndex, msg.buffer);
+          } else if (msg.type === "SEGMENT_CHUNK") {
+            handleIncomingChunk(msg);
           }
         });
 
@@ -762,6 +820,9 @@
       sourceBuffers = {};
       appendQueues = {};
       guestTrackMeta = {};
+      inFlightRequests = {};
+      incomingChunks = {};
+      currentSeekEpoch++;
 
       mediaSource = new MediaSource();
       videoEl.src = URL.createObjectURL(mediaSource);
@@ -774,36 +835,40 @@
         } catch (e) {}
 
         manifest.tracks.forEach((track) => {
-          if (!MediaSource.isTypeSupported(track.mime)) {
-            console.warn("Codec não suportado neste navegador:", track.mime);
-            return;
-          }
+          if (!MediaSource.isTypeSupported(track.mime)) return;
 
           const sb = mediaSource.addSourceBuffer(track.mime);
           sourceBuffers[track.id] = sb;
           appendQueues[track.id] = [track.initBuffer];
+          inFlightRequests[track.id] = new Set();
           guestTrackMeta[track.id] = {
             totalSegments: track.totalSegments,
             nextSegmentToRequest: 0,
-            duration: manifest.duration
+            duration: manifest.duration,
+            isCleaning: false
           };
 
           sb.addEventListener("updateend", () => {
+            guestTrackMeta[track.id].isCleaning = false;
             processAppendQueue(track.id);
             fillAheadBuffer(track.id);
           });
 
           processAppendQueue(track.id);
-          // Pede os primeiros 4 segmentos (~8 segundos iniciais)
-          for (let i = 0; i < Math.min(4, track.totalSegments); i++) {
+          // Pede os primeiros 3 segmentos (~4.5s) de forma leve
+          for (let i = 0; i < Math.min(3, track.totalSegments); i++) {
             requestNextSegment(track.id);
           }
         });
       });
 
-      // Monitora continuamente o avanço do vídeo para pedir os próximos pedaços
+      // Loop de manutenção do buffer e limpeza de RAM passada
       setInterval(() => {
-        Object.keys(guestTrackMeta).forEach((trackId) => fillAheadBuffer(Number(trackId)));
+        Object.keys(guestTrackMeta).forEach((idStr) => {
+          const trackId = Number(idStr);
+          cleanupOldBuffer(trackId);
+          fillAheadBuffer(trackId);
+        });
       }, 1000);
 
       videoEl.addEventListener("click", () => {
@@ -813,15 +878,53 @@
       });
     }
 
-    function enqueueSegmentBuffer(trackId, segIndex, buffer) {
-      if (!appendQueues[trackId]) return;
-      appendQueues[trackId].push(buffer);
-      processAppendQueue(trackId);
+    // Remonta os pacotes de 64 KB no segmento completo
+    function handleIncomingChunk(msg) {
+      // Descarta pacotes atrasados que pertenciam a antes de um seek
+      if (msg.epoch !== currentSeekEpoch) return;
 
-      // Libera a tela assim que houver pelo menos 2 segundos de buffer pronto
-      if (videoEl.buffered.length > 0 && videoEl.buffered.end(0) > 1.5) {
-        if (statusOverlay.textContent.includes("Carregando buffer")) {
-          statusOverlay.style.display = "none";
+      const key = `${msg.trackId}_${msg.segIndex}`;
+      if (!incomingChunks[key]) {
+        incomingChunks[key] = {
+          total: msg.totalParts,
+          received: 0,
+          parts: new Array(msg.totalParts)
+        };
+      }
+
+      const entry = incomingChunks[key];
+      if (!entry.parts[msg.partIdx]) {
+        entry.parts[msg.partIdx] = msg.chunk;
+        entry.received++;
+      }
+
+      if (entry.received === entry.total) {
+        delete incomingChunks[key];
+        if (inFlightRequests[msg.trackId]) {
+          inFlightRequests[msg.trackId].delete(msg.segIndex);
+        }
+
+        // Junta todos os pedaços em um único ArrayBuffer
+        let totalBytes = 0;
+        for (const part of entry.parts) totalBytes += part.byteLength;
+        const merged = new Uint8Array(totalBytes);
+        let offset = 0;
+        for (const part of entry.parts) {
+          merged.set(new Uint8Array(part), offset);
+          offset += part.byteLength;
+        }
+
+        if (appendQueues[msg.trackId]) {
+          appendQueues[msg.trackId].push(merged.buffer);
+          processAppendQueue(msg.trackId);
+        }
+
+        // Esconde aviso de carregamento assim que houver buffer suficiente
+        if (videoEl.buffered.length > 0) {
+          const bufEnd = videoEl.buffered.end(videoEl.buffered.length - 1);
+          if (bufEnd - videoEl.currentTime > 1.5 && statusOverlay.textContent.includes("Carregando")) {
+            statusOverlay.style.display = "none";
+          }
         }
       }
     }
@@ -835,7 +938,29 @@
       try {
         sb.appendBuffer(nextBuf);
       } catch (e) {
-        console.warn("Erro ao inserir buffer MSE:", e);
+        // Se a memória do SourceBuffer encher (QuotaExceededError), limpa o passado
+        if (e.name === "QuotaExceededError") {
+          queue.unshift(nextBuf);
+          cleanupOldBuffer(trackId, true);
+        }
+      }
+    }
+
+    // Limpa trechos já assistidos (mais de 15s atrás) para não estourar RAM no celular
+    function cleanupOldBuffer(trackId, force = false) {
+      const sb = sourceBuffers[trackId];
+      const meta = guestTrackMeta[trackId];
+      if (!sb || sb.updating || !meta || meta.isCleaning || sb.buffered.length === 0) return;
+
+      const start = sb.buffered.start(0);
+      const safeCut = videoEl.currentTime - (force ? 5 : 15);
+      if (safeCut > start + 2) {
+        try {
+          meta.isCleaning = true;
+          sb.remove(start, safeCut);
+        } catch (e) {
+          meta.isCleaning = false;
+        }
       }
     }
 
@@ -843,12 +968,18 @@
       const meta = guestTrackMeta[trackId];
       if (!meta || meta.nextSegmentToRequest >= meta.totalSegments) return;
 
+      // Limita a no máximo 2 segmentos em trânsito simultâneo para não congestionar o Wi-Fi
+      if (inFlightRequests[trackId] && inFlightRequests[trackId].size >= 2) return;
+
       const idx = meta.nextSegmentToRequest++;
+      if (inFlightRequests[trackId]) inFlightRequests[trackId].add(idx);
+
       if (hostConnection && hostConnection.open) {
         hostConnection.send({
           type: "REQ_SEGMENT",
           trackId: trackId,
-          segIndex: idx
+          segIndex: idx,
+          epoch: currentSeekEpoch
         });
       }
     }
@@ -858,24 +989,66 @@
       const meta = guestTrackMeta[trackId];
       if (!sb || !meta || meta.nextSegmentToRequest >= meta.totalSegments) return;
 
-      let bufferedEnd = 0;
+      let bufferedEnd = videoEl.currentTime;
       for (let i = 0; i < sb.buffered.length; i++) {
         if (videoEl.currentTime >= sb.buffered.start(i) - 1 && videoEl.currentTime <= sb.buffered.end(i) + 1) {
           bufferedEnd = sb.buffered.end(i);
           break;
         }
       }
-      if (bufferedEnd === 0 && sb.buffered.length > 0) {
-        bufferedEnd = sb.buffered.end(sb.buffered.length - 1);
-      }
 
-      // Mantém sempre pelo menos 25 segundos de filme adiantados no buffer
-      if (bufferedEnd - videoEl.currentTime < 25 && appendQueues[trackId].length < 4) {
+      // Mantém ~12 segundos de buffer adiantado (equilíbrio ideal entre fluidez e rede leve)
+      if (bufferedEnd - videoEl.currentTime < 12 && appendQueues[trackId].length < 3) {
         requestNextSegment(trackId);
       }
     }
 
-    // Escuta Play / Pause / Seek do Host via Firestore
+    // Reseta o SourceBuffer limpo quando o Host pula de cena (Seek)
+    function resetBuffersForSeek(targetTime) {
+      currentSeekEpoch++;
+      incomingChunks = {};
+
+      if (hostConnection && hostConnection.open) {
+        hostConnection.send({ type: "CLEAR_QUEUE" });
+      }
+
+      statusOverlay.style.display = "block";
+      statusOverlay.textContent = "Carregando nova cena...";
+
+      Object.keys(sourceBuffers).forEach((idStr) => {
+        const trackId = Number(idStr);
+        const sb = sourceBuffers[trackId];
+        const meta = guestTrackMeta[trackId];
+        if (!sb || !meta) return;
+
+        appendQueues[trackId] = [];
+        inFlightRequests[trackId] = new Set();
+
+        if (meta.duration > 0 && meta.totalSegments > 0) {
+          const targetIdx = Math.floor((targetTime / meta.duration) * meta.totalSegments);
+          meta.nextSegmentToRequest = Math.max(0, Math.min(targetIdx, meta.totalSegments - 1));
+        }
+
+        try {
+          if (sb.updating) sb.abort();
+          if (sb.buffered.length > 0) {
+            meta.isCleaning = true;
+            sb.remove(0, Infinity);
+          }
+        } catch (e) {}
+
+        // Pede os 2 primeiros segmentos do novo minuto imediatamente
+        setTimeout(() => {
+          requestNextSegment(trackId);
+          requestNextSegment(trackId);
+        }, 50);
+      });
+
+      videoEl.currentTime = targetTime;
+    }
+
+    let lastSeekId = -1;
+
     function listenToHostPlayback() {
       onSnapshot(doc(db, "salas", currentRoomId), (snap) => {
         if (!snap.exists()) return;
@@ -883,15 +1056,12 @@
         const pb = data.playback;
         if (!pb) return;
 
-        // Se o Host pulou para uma parte ainda não baixada no buffer, ajusta o índice de pedido
-        if (Math.abs(videoEl.currentTime - pb.currentTime) > 2.5) {
-          Object.values(guestTrackMeta).forEach((meta) => {
-            if (meta.duration > 0 && meta.totalSegments > 0) {
-              const targetIdx = Math.floor((pb.currentTime / meta.duration) * meta.totalSegments);
-              meta.nextSegmentToRequest = Math.max(0, Math.min(targetIdx, meta.totalSegments - 1));
-            }
-          });
-          videoEl.currentTime = pb.currentTime;
+        // Detecta se houve seek explícito do Host ou dessincronia grande (> 3s)
+        const seekChanged = pb.seekId !== undefined && pb.seekId !== lastSeekId && lastSeekId !== -1;
+        lastSeekId = pb.seekId ?? 0;
+
+        if (seekChanged || Math.abs(videoEl.currentTime - pb.currentTime) > 3.5) {
+          resetBuffersForSeek(pb.currentTime);
         }
 
         if (pb.isPlaying && videoEl.paused) {
