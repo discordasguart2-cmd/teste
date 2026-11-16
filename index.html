@@ -73,10 +73,11 @@
       cursor: pointer;
       transition: 0.2s;
     }
+    .btn:disabled { opacity: 0.6; cursor: not-allowed; }
     .btn-primary { background: var(--accent); color: white; }
-    .btn-primary:hover { background: var(--accent-hover); }
+    .btn-primary:hover:not(:disabled) { background: var(--accent-hover); }
     .btn-secondary { background: var(--bg-input); color: var(--text-main); border: 1px solid var(--border); }
-    .btn-secondary:hover { background: #272730; }
+    .btn-secondary:hover:not(:disabled) { background: #272730; }
 
     .divider {
       text-align: center;
@@ -281,7 +282,7 @@
 
       <div class="form-group">
         <label for="username-input">Seu Apelido</label>
-        <input type="text" id="username-input" placeholder="Ex: Loki" maxlength="20" />
+        <input type="text" id="username-input" placeholder="Ex: thor" maxlength="20" />
       </div>
 
       <button class="btn btn-primary" id="create-room-btn">Criar Nova Sala (Host)</button>
@@ -370,6 +371,8 @@
     const cinemaScreen = document.getElementById("cinema-screen");
     const usernameInput = document.getElementById("username-input");
     const roomCodeInput = document.getElementById("room-code-input");
+    const createRoomBtn = document.getElementById("create-room-btn");
+    const joinRoomBtn = document.getElementById("join-room-btn");
     const displayRoomCode = document.getElementById("display-room-code");
     const hostControls = document.getElementById("host-controls");
     const videoFileInput = document.getElementById("video-file-input");
@@ -386,65 +389,25 @@
     }
 
     // =========================================================================
-    // 2. FORÇA ALTA QUALIDADE SEPARADA PARA VÍDEO E ÁUDIO ESTÉREO NO SDP
+    // 2. SDP LIMPO PARA VÍDEO HD E ÁUDIO ESTÉREO
     // =========================================================================
     function boostSDP(sdp) {
-      const lines = sdp.split("\r\n");
-      const newLines = [];
-      let currentSection = ""; // "audio" ou "video"
-      let opusPayloadType = null;
-
-      // Primeiro descobre o número do payload do codec Opus
-      for (const line of lines) {
-        const opusMatch = line.match(/^a=rtpmap:(\d+) opus\/48000\/2/i);
-        if (opusMatch) {
-          opusPayloadType = opusMatch[1];
-          break;
-        }
-      }
-
-      for (let i = 0; i < lines.length; i++) {
-        const line = lines[i];
-
-        if (line.startsWith("m=video")) {
-          currentSection = "video";
-          newLines.push(line);
-          newLines.push("b=AS:10000");
-          newLines.push("b=TIAS:10000000");
-          continue;
-        }
-
-        if (line.startsWith("m=audio")) {
-          currentSection = "audio";
-          newLines.push(line);
-          newLines.push("b=AS:256");
-          continue;
-        }
-
-        if (line.startsWith("m=")) {
-          currentSection = "other";
-        }
-
-        // Aplica parâmetros de bitrate alto APENAS nos codecs de vídeo
-        if (currentSection === "video" && line.startsWith("a=fmtp:")) {
-          newLines.push(line + ";x-google-min-bitrate=4000;x-google-start-bitrate=6000;x-google-max-bitrate=10000");
-          continue;
-        }
-
-        // Configura o Opus para áudio estéreo de cinema (sem modo mono/voz)
-        if (currentSection === "audio" && opusPayloadType && line.startsWith(`a=fmtp:${opusPayloadType}`)) {
-          newLines.push(`a=fmtp:${opusPayloadType} minptime=10;useinbandfec=1;stereo=1;sprop-stereo=1;maxaveragebitrate=256000;cbr=1`);
-          continue;
-        }
-
-        newLines.push(line);
-      }
-
-      return newLines.join("\r\n");
+      return sdp
+        .replace(/(m=video .*\r\n)/g, "$1b=AS:10000\r\n")
+        .replace(/(m=audio .*\r\n)/g, "$1b=AS:256\r\n")
+        .replace(/(a=fmtp:111 .*)/g, "$1;stereo=1;sprop-stereo=1;maxaveragebitrate=256000");
     }
 
     function initPeer() {
       return new Promise((resolve, reject) => {
+        if (typeof Peer === "undefined") {
+          return reject(new Error("Biblioteca PeerJS não carregou. Verifique sua conexão."));
+        }
+
+        const timeout = setTimeout(() => {
+          reject(new Error("Tempo esgotado ao conectar no servidor P2P. Tente novamente."));
+        }, 10000);
+
         peer = new Peer({
           sdpTransform: boostSDP,
           config: {
@@ -456,13 +419,14 @@
         });
 
         peer.on("open", (id) => {
+          clearTimeout(timeout);
           myPeerId = id;
           resolve(id);
         });
 
         peer.on("error", (err) => {
+          clearTimeout(timeout);
           console.error("Erro PeerJS:", err);
-          alert("Erro de conexão P2P: " + err.type);
           reject(err);
         });
       });
@@ -471,9 +435,12 @@
     // =========================================================================
     // 3. CRIAR SALA (HOST)
     // =========================================================================
-    document.getElementById("create-room-btn").addEventListener("click", async () => {
+    createRoomBtn.addEventListener("click", async () => {
       const name = usernameInput.value.trim();
       if (!name) return alert("Digite seu apelido primeiro.");
+
+      createRoomBtn.disabled = true;
+      createRoomBtn.textContent = "Conectando...";
 
       currentUser = name;
       isHost = true;
@@ -499,17 +466,22 @@
         listenToChat();
       } catch (e) {
         console.error(e);
-        alert("Falha ao criar sala.");
+        alert("Erro ao criar sala: " + (e.message || e.type || e));
+        createRoomBtn.disabled = false;
+        createRoomBtn.textContent = "Criar Nova Sala (Host)";
       }
     });
 
     // =========================================================================
     // 4. ENTRAR NA SALA (CONVIDADO)
     // =========================================================================
-    document.getElementById("join-room-btn").addEventListener("click", async () => {
+    joinRoomBtn.addEventListener("click", async () => {
       const name = usernameInput.value.trim();
       const code = roomCodeInput.value.trim().toUpperCase();
       if (!name || !code) return alert("Preencha seu apelido e o código da sala.");
+
+      joinRoomBtn.disabled = true;
+      joinRoomBtn.textContent = "Entrando...";
 
       currentUser = name;
       isHost = false;
@@ -520,6 +492,8 @@
         const roomSnap = await getDoc(roomRef);
 
         if (!roomSnap.exists()) {
+          joinRoomBtn.disabled = false;
+          joinRoomBtn.textContent = "Entrar como Convidado";
           return alert("Sala não encontrada! Verifique o código.");
         }
 
@@ -561,12 +535,14 @@
         listenToChat();
       } catch (e) {
         console.error(e);
-        alert("Erro ao entrar na sala.");
+        alert("Erro ao entrar na sala: " + (e.message || e.type || e));
+        joinRoomBtn.disabled = false;
+        joinRoomBtn.textContent = "Entrar como Convidado";
       }
     });
 
     // =========================================================================
-    // 5. CAPTURA E TRANSMISSÃO DO VÍDEO E ÁUDIO SEM FILTROS DE VOZ (HOST)
+    // 5. CAPTURA E TRANSMISSÃO DO VÍDEO E ÁUDIO ESTÉREO (HOST)
     // =========================================================================
     async function applyHighQualityTracks(stream) {
       const videoTrack = stream.getVideoTracks()[0];
@@ -574,7 +550,6 @@
         videoTrack.contentHint = "detail";
       }
 
-      // Remove filtros de voz (eco/ruído/AGC) para preservar o som original do filme
       const audioTrack = stream.getAudioTracks()[0];
       if (audioTrack) {
         if ("contentHint" in audioTrack) {
@@ -587,7 +562,7 @@
             autoGainControl: false
           });
         } catch (e) {
-          console.warn("Constraints de áudio não suportadas:", e);
+          console.warn("Constraints de áudio ignoradas:", e);
         }
       }
     }
@@ -603,3 +578,176 @@
             const otherCodecs = capabilities.codecs.filter((c) => c.mimeType.toLowerCase() !== "video/h264");
             if (h264Codecs.length > 0 && transceiver.setCodecPreferences) {
               transceiver.setCodecPreferences([...h264Codecs, ...otherCodecs]);
+            }
+          }
+        });
+      } catch (e) {}
+    }
+
+    async function boostCallQuality(call) {
+      const applyParams = async () => {
+        try {
+          const pc = call.peerConnection;
+          if (!pc) return;
+          preferH264Codec(pc);
+
+          const senders = pc.getSenders();
+          for (const sender of senders) {
+            if (sender.track && sender.track.kind === "video") {
+              const params = sender.getParameters();
+              if (!params.encodings || params.encodings.length === 0) params.encodings = [{}];
+              params.encodings[0].maxBitrate = 10000000;
+              params.encodings[0].scaleResolutionDownBy = 1.0;
+              params.degradationPreference = "maintain-resolution";
+              await sender.setParameters(params);
+            }
+            if (sender.track && sender.track.kind === "audio") {
+              const params = sender.getParameters();
+              if (!params.encodings || params.encodings.length === 0) params.encodings = [{}];
+              params.encodings[0].maxBitrate = 256000;
+              await sender.setParameters(params);
+            }
+          }
+        } catch (err) {}
+      };
+
+      setTimeout(applyParams, 500);
+      setTimeout(applyParams, 2500);
+    }
+
+    videoFileInput.addEventListener("change", (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+
+      const fileURL = URL.createObjectURL(file);
+      videoEl.src = fileURL;
+      statusOverlay.style.display = "none";
+
+      videoEl.onloadedmetadata = async () => {
+        videoEl.play();
+        if (videoEl.captureStream) {
+          localStream = videoEl.captureStream();
+        } else if (videoEl.mozCaptureStream) {
+          localStream = videoEl.mozCaptureStream();
+        } else {
+          return alert("Seu navegador não suporta captureStream(). Use Chrome ou Edge.");
+        }
+
+        await applyHighQualityTracks(localStream);
+        broadcastStreamToAllGuests();
+        sendSystemMessage(`🎬 Filme carregado: ${file.name}`);
+      };
+    });
+
+    let currentGuestsList = [];
+
+    function broadcastStreamToAllGuests() {
+      if (!isHost || !localStream) return;
+      currentGuestsList.forEach((guest) => {
+        if (activeCalls.has(guest.peerId)) {
+          activeCalls.get(guest.peerId).close();
+        }
+        const call = peer.call(guest.peerId, localStream, { sdpTransform: boostSDP });
+        boostCallQuality(call);
+        activeCalls.set(guest.peerId, call);
+      });
+    }
+
+    // =========================================================================
+    // 6. SINCRONIZAÇÃO FIRESTORE (SALA E CHAT)
+    // =========================================================================
+    function listenToRoomChanges() {
+      onSnapshot(doc(db, "salas", currentRoomId), (snapshot) => {
+        if (!snapshot.exists()) return;
+        const data = snapshot.data();
+        const guests = data.guests || [];
+        currentGuestsList = guests;
+
+        viewersCount.textContent = `${guests.length + 1} online`;
+
+        if (isHost && localStream) {
+          guests.forEach((guest) => {
+            if (!activeCalls.has(guest.peerId)) {
+              const call = peer.call(guest.peerId, localStream, { sdpTransform: boostSDP });
+              boostCallQuality(call);
+              activeCalls.set(guest.peerId, call);
+            }
+          });
+        }
+      });
+    }
+
+    function listenToChat() {
+      const q = query(
+        collection(db, "salas", currentRoomId, "mensagens"),
+        orderBy("createdAt", "asc")
+      );
+
+      onSnapshot(q, (snapshot) => {
+        chatMessages.innerHTML = "";
+        snapshot.forEach((docSnap) => {
+          const msg = docSnap.data();
+          const div = document.createElement("div");
+
+          if (msg.system) {
+            div.className = "msg-system";
+            div.textContent = msg.text;
+          } else {
+            div.className = "msg";
+            div.innerHTML = `<div class="msg-author">${escapeHTML(msg.author)}</div><div>${escapeHTML(msg.text)}</div>`;
+          }
+          chatMessages.appendChild(div);
+        });
+        chatMessages.scrollTop = chatMessages.scrollHeight;
+      });
+    }
+
+    chatForm.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const text = chatInput.value.trim();
+      if (!text || !currentRoomId) return;
+
+      chatInput.value = "";
+      await addDoc(collection(db, "salas", currentRoomId, "mensagens"), {
+        author: currentUser,
+        text: text,
+        system: false,
+        createdAt: serverTimestamp()
+      });
+    });
+
+    async function sendSystemMessage(text) {
+      await addDoc(collection(db, "salas", currentRoomId, "mensagens"), {
+        text: text,
+        system: true,
+        createdAt: serverTimestamp()
+      });
+    }
+
+    // =========================================================================
+    // 7. UTILITÁRIOS DE INTERFACE
+    // =========================================================================
+    function enterCinemaUI() {
+      lobbyScreen.style.display = "none";
+      cinemaScreen.style.display = "grid";
+      displayRoomCode.textContent = currentRoomId;
+
+      const newUrl = `${window.location.origin}${window.location.pathname}?sala=${currentRoomId}`;
+      window.history.replaceState({}, "", newUrl);
+    }
+
+    displayRoomCode.addEventListener("click", () => {
+      navigator.clipboard.writeText(window.location.href);
+      const original = displayRoomCode.textContent;
+      displayRoomCode.textContent = "Link Copiado!";
+      setTimeout(() => (displayRoomCode.textContent = original), 1500);
+    });
+
+    function escapeHTML(str) {
+      return str.replace(/[&<>"']/g, (m) => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+      }[m]));
+    }
+  </script>
+</body>
+</html>
