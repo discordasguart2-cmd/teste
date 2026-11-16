@@ -3,8 +3,10 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Sala de Cinema — P2P Stream HD</title>
+  <title>Sala de Cinema — Bitrate Original (MSE + P2P)</title>
+  <!-- PeerJS & MP4Box.js via CDN -->
   <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mp4box@0.5.2/dist/mp4box.all.min.js"></script>
   <style>
     :root {
       --bg-dark: #09090b;
@@ -121,6 +123,7 @@
       background: var(--bg-panel);
       border-bottom: 1px solid var(--border);
       gap: 12px;
+      flex-wrap: wrap;
     }
 
     .room-badge {
@@ -143,24 +146,16 @@
     .host-controls {
       display: flex;
       align-items: center;
-      gap: 12px;
+      gap: 10px;
     }
 
-    .gain-control {
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      font-size: 0.8rem;
-      color: var(--text-muted);
-      background: var(--bg-input);
-      padding: 5px 10px;
-      border-radius: 6px;
-      border: 1px solid var(--border);
-    }
-    .gain-control input[type="range"] {
-      width: 70px;
-      accent-color: var(--accent);
-      cursor: pointer;
+    .quality-tag {
+      font-size: 0.75rem;
+      background: #14532d;
+      color: #86efac;
+      padding: 4px 8px;
+      border-radius: 4px;
+      font-weight: 600;
     }
 
     .file-label {
@@ -196,11 +191,12 @@
       position: absolute;
       text-align: center;
       color: var(--text-main);
-      background: rgba(0, 0, 0, 0.7);
-      padding: 10px 18px;
+      background: rgba(0, 0, 0, 0.78);
+      padding: 12px 20px;
       border-radius: 8px;
       pointer-events: none;
       font-size: 0.95rem;
+      max-width: 85%;
     }
 
     /* Chat Lateral */
@@ -295,11 +291,11 @@
   <div id="lobby-screen">
     <div class="lobby-card">
       <h1>🍿 Sala de Cinema</h1>
-      <p>Transmita um vídeo direto do seu PC em Full HD.</p>
+      <p>Streaming P2P direto do arquivo MP4 com 100% da qualidade original.</p>
 
       <div class="form-group">
         <label for="username-input">Seu Apelido</label>
-        <input type="text" id="username-input" placeholder="Ex: Doom" maxlength="20" />
+        <input type="text" id="username-input" placeholder="Ex: Pedro" maxlength="20" />
       </div>
 
       <button class="btn btn-primary" id="create-room-btn">Criar Nova Sala (Host)</button>
@@ -322,16 +318,12 @@
         <div class="room-badge">
           <span>Sala:</span>
           <span class="room-code" id="display-room-code" title="Clique para copiar">---</span>
+          <span class="quality-tag" id="quality-badge">Qualidade Original</span>
         </div>
 
         <div class="host-controls" id="host-controls" style="display: none;">
-          <div class="gain-control" title="Ganho de áudio enviado para os convidados">
-            <span>🔊 Ganho:</span>
-            <input type="range" id="stream-gain-slider" min="0.5" max="2.5" step="0.1" value="1.3" />
-            <span id="stream-gain-val">130%</span>
-          </div>
-          <label for="video-file-input" class="file-label">📁 Escolher Vídeo Local</label>
-          <input type="file" id="video-file-input" accept="video/mp4,video/webm,video/ogg,video/x-matroska" />
+          <label for="video-file-input" class="file-label">📁 Escolher Vídeo (.mp4)</label>
+          <input type="file" id="video-file-input" accept="video/mp4" />
         </div>
       </div>
 
@@ -360,7 +352,7 @@
     import {
       getFirestore, doc, setDoc, getDoc, updateDoc,
       collection, addDoc, onSnapshot, query, orderBy,
-      serverTimestamp, arrayUnion
+      serverTimestamp
     } from "https://www.gstatic.com/firebasejs/11.0.2/firebase-firestore.js";
 
     // =========================================================================
@@ -379,20 +371,25 @@
     const app = initializeApp(firebaseConfig);
     const db = getFirestore(app);
 
-    // Variáveis de Estado
+    // Variáveis de Estado Geral
     let peer = null;
     let myPeerId = null;
     let currentRoomId = null;
     let currentUser = "";
     let isHost = false;
-    let localStream = null;
-    const activeCalls = new Map();
 
-    // Web Audio API (Mantém o áudio contínuo e imune a seek/avanço)
-    let audioCtx = null;
-    let audioSourceNode = null;
-    let audioGainNode = null;
-    let audioDestNode = null;
+    // Variáveis do Host (Segmentação MP4Box em Memória/Disco Local)
+    let mediaReady = false;
+    let mediaMeta = null; // { duration, tracks: [{ id, codec, mime, initBuffer, segments: [{ index, time, duration, buffer }] }] }
+    const guestConnections = new Map(); // guestPeerId -> DataConnection
+
+    // Variáveis do Convidado (MediaSource Extensions)
+    let hostConnection = null;
+    let mediaSource = null;
+    let sourceBuffers = {}; // trackId -> SourceBuffer
+    let appendQueues = {};  // trackId -> Array<ArrayBuffer>
+    let guestTrackMeta = {}; // trackId -> { totalSegments, nextSegmentToRequest, duration }
+    let isSyncingFromHost = false;
 
     // Elementos DOM
     const lobbyScreen = document.getElementById("lobby-screen");
@@ -410,45 +407,26 @@
     const chatForm = document.getElementById("chat-form");
     const chatInput = document.getElementById("chat-input");
     const viewersCount = document.getElementById("viewers-count");
-    const gainSlider = document.getElementById("stream-gain-slider");
-    const gainVal = document.getElementById("stream-gain-val");
+    const qualityBadge = document.getElementById("quality-badge");
 
     const urlParams = new URLSearchParams(window.location.search);
     if (urlParams.get("sala")) {
       roomCodeInput.value = urlParams.get("sala").toUpperCase();
     }
 
-    // Controle de Ganho de Áudio em Tempo Real
-    gainSlider.addEventListener("input", () => {
-      const val = parseFloat(gainSlider.value);
-      gainVal.textContent = `${Math.round(val * 100)}%`;
-      if (audioGainNode) {
-        audioGainNode.gain.value = val;
-      }
-    });
-
     // =========================================================================
-    // 2. SDP LIMPO PARA VÍDEO HD E ÁUDIO ESTÉREO
+    // 2. INICIALIZAÇÃO DO PEERJS (CANAL DE DADOS BINÁRIOS)
     // =========================================================================
-    function boostSDP(sdp) {
-      return sdp
-        .replace(/(m=video .*\r\n)/g, "$1b=AS:10000\r\n")
-        .replace(/(m=audio .*\r\n)/g, "$1b=AS:256\r\n")
-        .replace(/(a=fmtp:111 .*)/g, "$1;stereo=1;sprop-stereo=1;maxaveragebitrate=256000");
-    }
-
     function initPeer() {
       return new Promise((resolve, reject) => {
         if (typeof Peer === "undefined") {
-          return reject(new Error("Biblioteca PeerJS não carregou. Verifique sua conexão."));
+          return reject(new Error("PeerJS não carregou."));
         }
-
         const timeout = setTimeout(() => {
-          reject(new Error("Tempo esgotado ao conectar no servidor P2P. Tente novamente."));
+          reject(new Error("Timeout ao conectar no servidor P2P."));
         }, 10000);
 
         peer = new Peer({
-          sdpTransform: boostSDP,
           config: {
             iceServers: [
               { urls: "stun:stun.l.google.com:19302" },
@@ -472,7 +450,7 @@
     }
 
     // =========================================================================
-    // 3. CRIAR SALA (HOST)
+    // 3. HOST: CRIAR SALA E SERVIR SEGMENTOS ORIGINAIS
     // =========================================================================
     createRoomBtn.addEventListener("click", async () => {
       const name = usernameInput.value.trim();
@@ -488,31 +466,232 @@
       try {
         await initPeer();
 
+        // Escuta conexões de dados dos convidados
+        peer.on("connection", (conn) => {
+          guestConnections.set(conn.peer, conn);
+          updateOnlineCount();
+
+          conn.on("open", () => {
+            if (mediaReady && mediaMeta) {
+              sendInitManifestToGuest(conn);
+            }
+          });
+
+          conn.on("data", (msg) => {
+            if (msg && msg.type === "REQ_SEGMENT") {
+              sendSegmentToGuest(conn, msg.trackId, msg.segIndex);
+            }
+          });
+
+          conn.on("close", () => {
+            guestConnections.delete(conn.peer);
+            updateOnlineCount();
+          });
+        });
+
         await setDoc(doc(db, "salas", currentRoomId), {
           hostPeerId: myPeerId,
           hostName: currentUser,
-          guests: [],
+          playback: { isPlaying: false, currentTime: 0, updatedAt: Date.now() },
           createdAt: serverTimestamp()
         });
 
         enterCinemaUI();
         hostControls.style.display = "flex";
         videoEl.controls = true;
-        statusOverlay.textContent = "Clique em 'Escolher Vídeo Local' acima para iniciar a sessão.";
+        statusOverlay.textContent = "Clique em 'Escolher Vídeo (.mp4)' acima para preparar o streaming original.";
 
+        setupHostPlaybackSync();
         await sendSystemMessage(`${currentUser} abriu a sala.`);
-        listenToRoomChanges();
         listenToChat();
       } catch (e) {
         console.error(e);
-        alert("Erro ao criar sala: " + (e.message || e.type || e));
+        alert("Erro ao criar sala: " + (e.message || e));
         createRoomBtn.disabled = false;
         createRoomBtn.textContent = "Criar Nova Sala (Host)";
       }
     });
 
+    function updateOnlineCount() {
+      viewersCount.textContent = `${guestConnections.size + 1} online`;
+    }
+
+    // Fragmenta o arquivo MP4 local sem perder qualidade usando MP4Box.js
+    videoFileInput.addEventListener("change", async (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+
+      statusOverlay.style.display = "block";
+      statusOverlay.textContent = "Indexando faixas de vídeo e áudio original (aguarde)...";
+
+      // Toca localmente direto do disco para o Host
+      videoEl.src = URL.createObjectURL(file);
+
+      try {
+        mediaMeta = await fragmentLocalMP4(file);
+        mediaReady = true;
+
+        const videoTrack = mediaMeta.tracks.find((t) => t.mime.startsWith("video/"));
+        if (videoTrack) {
+          qualityBadge.textContent = `Original (${videoTrack.width}x${videoTrack.height})`;
+        }
+
+        statusOverlay.style.display = "none";
+        await videoEl.play();
+
+        // Envia o manifesto inicial para todos os convidados já conectados
+        guestConnections.forEach((conn) => {
+          if (conn.open) sendInitManifestToGuest(conn);
+        });
+
+        sendSystemMessage(`🎬 Filme pronto em qualidade original: ${file.name}`);
+      } catch (err) {
+        console.error(err);
+        statusOverlay.textContent = "Erro ao ler MP4. Certifique-se de que o arquivo é .mp4 (H.264 + AAC).";
+      }
+    });
+
+    function fragmentLocalMP4(file) {
+      return new Promise((resolve, reject) => {
+        const mp4boxfile = MP4Box.createFile();
+        const tracksMap = {};
+        let movieDuration = 0;
+
+        mp4boxfile.onError = (e) => reject(e);
+
+        mp4boxfile.onReady = (info) => {
+          movieDuration = info.duration / info.timescale;
+
+          info.tracks.forEach((track) => {
+            // Seleciona apenas vídeo e áudio principal
+            if (track.type !== "video" && track.type !== "audio") return;
+
+            const mime = track.type === "video"
+              ? `video/mp4; codecs="${track.codec}"`
+              : `audio/mp4; codecs="${track.codec}"`;
+
+            tracksMap[track.id] = {
+              id: track.id,
+              type: track.type,
+              mime: mime,
+              width: track.video ? track.video.width : 0,
+              height: track.video ? track.video.height : 0,
+              timescale: track.timescale,
+              initBuffer: null,
+              segments: []
+            };
+
+            // Gera segmentos de ~2 segundos (50 amostras por segmento)
+            mp4boxfile.setSegmentOptions(track.id, null, { nbSamples: 50 });
+          });
+
+          const initSegs = mp4boxfile.initializeSegmentation();
+          initSegs.forEach((seg) => {
+            if (tracksMap[seg.id]) {
+              tracksMap[seg.id].initBuffer = seg.buffer;
+            }
+          });
+
+          mp4boxfile.start();
+        };
+
+        mp4boxfile.onSegment = (id, user, buffer, sampleNumber, last) => {
+          const track = tracksMap[id];
+          if (!track) return;
+
+          track.segments.push({
+            index: track.segments.length,
+            buffer: buffer
+          });
+        };
+
+        // Lê o arquivo do disco em blocos de 2 MB para não travar o navegador
+        const chunkSize = 2 * 1024 * 1024;
+        let offset = 0;
+        const reader = new FileReader();
+
+        reader.onload = (e) => {
+          const buf = e.target.result;
+          buf.fileStart = offset;
+          mp4boxfile.appendBuffer(buf);
+          offset += buf.byteLength;
+
+          if (offset < file.size) {
+            readNextChunk();
+          } else {
+            mp4boxfile.flush();
+            const validTracks = Object.values(tracksMap).filter((t) => t.initBuffer && t.segments.length > 0);
+            if (validTracks.length === 0) {
+              return reject(new Error("Nenhuma faixa compatível encontrada."));
+            }
+            resolve({
+              duration: movieDuration,
+              tracks: validTracks
+            });
+          }
+        };
+
+        reader.onerror = (err) => reject(err);
+
+        function readNextChunk() {
+          const slice = file.slice(offset, offset + chunkSize);
+          reader.readAsArrayBuffer(slice);
+        }
+
+        readNextChunk();
+      });
+    }
+
+    function sendInitManifestToGuest(conn) {
+      const manifest = {
+        type: "INIT_MANIFEST",
+        duration: mediaMeta.duration,
+        tracks: mediaMeta.tracks.map((t) => ({
+          id: t.id,
+          type: t.type,
+          mime: t.mime,
+          width: t.width,
+          height: t.height,
+          totalSegments: t.segments.length,
+          initBuffer: t.initBuffer
+        }))
+      };
+      conn.send(manifest);
+    }
+
+    function sendSegmentToGuest(conn, trackId, segIndex) {
+      if (!mediaMeta) return;
+      const track = mediaMeta.tracks.find((t) => t.id === trackId);
+      if (!track || !track.segments[segIndex]) return;
+
+      conn.send({
+        type: "SEGMENT_DATA",
+        trackId: trackId,
+        segIndex: segIndex,
+        buffer: track.segments[segIndex].buffer
+      });
+    }
+
+    // Sincroniza Play / Pause / Seek do Host no Firestore
+    function setupHostPlaybackSync() {
+      const roomRef = doc(db, "salas", currentRoomId);
+      const syncState = () => {
+        updateDoc(roomRef, {
+          playback: {
+            isPlaying: !videoEl.paused,
+            currentTime: videoEl.currentTime,
+            updatedAt: Date.now()
+          }
+        }).catch(() => {});
+      };
+
+      videoEl.addEventListener("play", syncState);
+      videoEl.addEventListener("pause", syncState);
+      videoEl.addEventListener("seeked", syncState);
+    }
+
     // =========================================================================
-    // 4. ENTRAR NA SALA (CONVIDADO)
+    // 4. CONVIDADO: RECEBER BYTES ORIGINAIS E MONTAR VIA MEDIASOURCE (MSE)
     // =========================================================================
     joinRoomBtn.addEventListener("click", async () => {
       const name = usernameInput.value.trim();
@@ -533,230 +712,206 @@
         if (!roomSnap.exists()) {
           joinRoomBtn.disabled = false;
           joinRoomBtn.textContent = "Entrar como Convidado";
-          return alert("Sala não encontrada! Verifique o código.");
+          return alert("Sala não encontrada!");
         }
 
+        const hostPeerId = roomSnap.data().hostPeerId;
         await initPeer();
 
-        peer.on("call", (call) => {
-          call.answer(null, { sdpTransform: boostSDP });
-          call.on("stream", (remoteStream) => {
-            videoEl.srcObject = remoteStream;
-            videoEl.controls = true;
+        hostConnection = peer.connect(hostPeerId, { reliable: true });
 
-            videoEl.play().then(() => {
-              statusOverlay.style.display = "none";
-            }).catch(() => {
-              videoEl.muted = true;
-              videoEl.play();
-              statusOverlay.style.display = "block";
-              statusOverlay.textContent = "Toque no vídeo para ativar o som 🔊";
-            });
-          });
+        hostConnection.on("open", () => {
+          enterCinemaUI();
+          videoEl.controls = true;
+          statusOverlay.textContent = "Conectado ao Host! Aguardando o filme iniciar...";
+          sendSystemMessage(`${currentUser} entrou na sala.`);
+          listenToHostPlayback();
+          listenToChat();
         });
 
-        videoEl.addEventListener("click", () => {
-          if (videoEl.muted) videoEl.muted = false;
-          if (videoEl.paused) videoEl.play();
-          statusOverlay.style.display = "none";
+        hostConnection.on("data", (msg) => {
+          if (!msg || !msg.type) return;
+          if (msg.type === "INIT_MANIFEST") {
+            initGuestMediaSource(msg);
+          } else if (msg.type === "SEGMENT_DATA") {
+            enqueueSegmentBuffer(msg.trackId, msg.segIndex, msg.buffer);
+          }
         });
 
-        await updateDoc(roomRef, {
-          guests: arrayUnion({ peerId: myPeerId, name: currentUser })
+        hostConnection.on("close", () => {
+          statusOverlay.style.display = "block";
+          statusOverlay.textContent = "Conexão com o Host encerrada.";
         });
-
-        enterCinemaUI();
-        videoEl.controls = true;
-        statusOverlay.textContent = "Conectado! Aguardando o Host iniciar o filme...";
-
-        await sendSystemMessage(`${currentUser} entrou na sala.`);
-        listenToRoomChanges();
-        listenToChat();
       } catch (e) {
         console.error(e);
-        alert("Erro ao entrar na sala: " + (e.message || e.type || e));
+        alert("Erro ao conectar na sala: " + (e.message || e));
         joinRoomBtn.disabled = false;
         joinRoomBtn.textContent = "Entrar como Convidado";
       }
     });
 
-    // =========================================================================
-    // 5. CAPTURA BLINDADA DE ÁUDIO (WEB AUDIO API) + VÍDEO HD (HOST)
-    // =========================================================================
-    function buildStableMediaStream(videoElement) {
-      // 1. Captura apenas o vídeo da tag <video>
-      const rawStream = videoElement.captureStream
-        ? videoElement.captureStream()
-        : videoElement.mozCaptureStream();
+    function initGuestMediaSource(manifest) {
+      statusOverlay.style.display = "block";
+      statusOverlay.textContent = "Carregando buffer em qualidade original...";
 
-      const videoTrack = rawStream.getVideoTracks()[0];
-      if (videoTrack && "contentHint" in videoTrack) {
-        videoTrack.contentHint = "detail";
+      const videoTrack = manifest.tracks.find((t) => t.type === "video");
+      if (videoTrack && videoTrack.width) {
+        qualityBadge.textContent = `Original (${videoTrack.width}x${videoTrack.height})`;
       }
 
-      // 2. Roteia o áudio pelo AudioContext para não quebrar ao mudar o tempo (seek)
-      if (!audioCtx) {
-        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-        audioSourceNode = audioCtx.createMediaElementSource(videoElement);
-        audioGainNode = audioCtx.createGain();
-        audioDestNode = audioCtx.createMediaStreamDestination();
+      sourceBuffers = {};
+      appendQueues = {};
+      guestTrackMeta = {};
 
-        audioGainNode.gain.value = parseFloat(gainSlider.value);
+      mediaSource = new MediaSource();
+      videoEl.src = URL.createObjectURL(mediaSource);
 
-        // Envia para os convidados (com ganho ajustável) E para os alto-falantes locais do PC
-        audioSourceNode.connect(audioGainNode);
-        audioGainNode.connect(audioDestNode);
-        audioSourceNode.connect(audioCtx.destination);
-      }
-
-      if (audioCtx.state === "suspended") {
-        audioCtx.resume();
-      }
-
-      const cleanAudioTrack = audioDestNode.stream.getAudioTracks()[0];
-      if (cleanAudioTrack && "contentHint" in cleanAudioTrack) {
-        cleanAudioTrack.contentHint = "music";
-      }
-
-      // 3. Combina vídeo HD + áudio contínuo estabilizado
-      const combinedStream = new MediaStream();
-      if (videoTrack) combinedStream.addTrack(videoTrack);
-      if (cleanAudioTrack) combinedStream.addTrack(cleanAudioTrack);
-
-      return combinedStream;
-    }
-
-    // Garante que o AudioContext nunca durma quando você avança/volta o filme
-    videoEl.addEventListener("seeked", () => {
-      if (!isHost) return;
-      if (audioCtx && audioCtx.state === "suspended") {
-        audioCtx.resume();
-      }
-      // Atualiza as trilhas nas conexões ativas para evitar dessincronia pós-seek
-      if (localStream) {
-        const videoTrack = localStream.getVideoTracks()[0];
-        const audioTrack = localStream.getAudioTracks()[0];
-        activeCalls.forEach((call) => {
-          const pc = call.peerConnection;
-          if (!pc) return;
-          pc.getSenders().forEach((sender) => {
-            if (sender.track && sender.track.kind === "video" && videoTrack) {
-              sender.replaceTrack(videoTrack).catch(() => {});
-            }
-            if (sender.track && sender.track.kind === "audio" && audioTrack) {
-              sender.replaceTrack(audioTrack).catch(() => {});
-            }
-          });
-        });
-      }
-    });
-
-    function preferH264Codec(pc) {
-      try {
-        const transceivers = pc.getTransceivers();
-        transceivers.forEach((transceiver) => {
-          if (transceiver.sender && transceiver.sender.track && transceiver.sender.track.kind === "video") {
-            const capabilities = RTCRtpSender.getCapabilities("video");
-            if (!capabilities) return;
-            const h264Codecs = capabilities.codecs.filter((c) => c.mimeType.toLowerCase() === "video/h264");
-            const otherCodecs = capabilities.codecs.filter((c) => c.mimeType.toLowerCase() !== "video/h264");
-            if (h264Codecs.length > 0 && transceiver.setCodecPreferences) {
-              transceiver.setCodecPreferences([...h264Codecs, ...otherCodecs]);
-            }
-          }
-        });
-      } catch (e) {}
-    }
-
-    async function boostCallQuality(call) {
-      const applyParams = async () => {
+      mediaSource.addEventListener("sourceopen", () => {
         try {
-          const pc = call.peerConnection;
-          if (!pc) return;
-          preferH264Codec(pc);
-
-          const senders = pc.getSenders();
-          for (const sender of senders) {
-            if (sender.track && sender.track.kind === "video") {
-              const params = sender.getParameters();
-              if (!params.encodings || params.encodings.length === 0) params.encodings = [{}];
-              params.encodings[0].maxBitrate = 10000000;
-              params.encodings[0].scaleResolutionDownBy = 1.0;
-              params.degradationPreference = "maintain-resolution";
-              await sender.setParameters(params);
-            }
-            if (sender.track && sender.track.kind === "audio") {
-              const params = sender.getParameters();
-              if (!params.encodings || params.encodings.length === 0) params.encodings = [{}];
-              params.encodings[0].maxBitrate = 256000;
-              await sender.setParameters(params);
-            }
+          if (isFinite(manifest.duration) && manifest.duration > 0) {
+            mediaSource.duration = manifest.duration;
           }
-        } catch (err) {}
-      };
+        } catch (e) {}
 
-      setTimeout(applyParams, 500);
-      setTimeout(applyParams, 2500);
-    }
+        manifest.tracks.forEach((track) => {
+          if (!MediaSource.isTypeSupported(track.mime)) {
+            console.warn("Codec não suportado neste navegador:", track.mime);
+            return;
+          }
 
-    videoFileInput.addEventListener("change", (e) => {
-      const file = e.target.files[0];
-      if (!file) return;
+          const sb = mediaSource.addSourceBuffer(track.mime);
+          sourceBuffers[track.id] = sb;
+          appendQueues[track.id] = [track.initBuffer];
+          guestTrackMeta[track.id] = {
+            totalSegments: track.totalSegments,
+            nextSegmentToRequest: 0,
+            duration: manifest.duration
+          };
 
-      const fileURL = URL.createObjectURL(file);
-      videoEl.src = fileURL;
-      statusOverlay.style.display = "none";
+          sb.addEventListener("updateend", () => {
+            processAppendQueue(track.id);
+            fillAheadBuffer(track.id);
+          });
 
-      videoEl.onloadedmetadata = async () => {
-        await videoEl.play();
-        if (!videoEl.captureStream && !videoEl.mozCaptureStream) {
-          return alert("Seu navegador não suporta captureStream(). Use Chrome ou Edge.");
-        }
+          processAppendQueue(track.id);
+          // Pede os primeiros 4 segmentos (~8 segundos iniciais)
+          for (let i = 0; i < Math.min(4, track.totalSegments); i++) {
+            requestNextSegment(track.id);
+          }
+        });
+      });
 
-        localStream = buildStableMediaStream(videoEl);
-        broadcastStreamToAllGuests();
-        sendSystemMessage(`🎬 Filme carregado: ${file.name}`);
-      };
-    });
+      // Monitora continuamente o avanço do vídeo para pedir os próximos pedaços
+      setInterval(() => {
+        Object.keys(guestTrackMeta).forEach((trackId) => fillAheadBuffer(Number(trackId)));
+      }, 1000);
 
-    let currentGuestsList = [];
-
-    function broadcastStreamToAllGuests() {
-      if (!isHost || !localStream) return;
-      currentGuestsList.forEach((guest) => {
-        if (activeCalls.has(guest.peerId)) {
-          activeCalls.get(guest.peerId).close();
-        }
-        const call = peer.call(guest.peerId, localStream, { sdpTransform: boostSDP });
-        boostCallQuality(call);
-        activeCalls.set(guest.peerId, call);
+      videoEl.addEventListener("click", () => {
+        if (videoEl.muted) videoEl.muted = false;
+        if (videoEl.paused) videoEl.play().catch(() => {});
+        statusOverlay.style.display = "none";
       });
     }
 
-    // =========================================================================
-    // 6. SINCRONIZAÇÃO FIRESTORE (SALA E CHAT)
-    // =========================================================================
-    function listenToRoomChanges() {
-      onSnapshot(doc(db, "salas", currentRoomId), (snapshot) => {
-        if (!snapshot.exists()) return;
-        const data = snapshot.data();
-        const guests = data.guests || [];
-        currentGuestsList = guests;
+    function enqueueSegmentBuffer(trackId, segIndex, buffer) {
+      if (!appendQueues[trackId]) return;
+      appendQueues[trackId].push(buffer);
+      processAppendQueue(trackId);
 
-        viewersCount.textContent = `${guests.length + 1} online`;
+      // Libera a tela assim que houver pelo menos 2 segundos de buffer pronto
+      if (videoEl.buffered.length > 0 && videoEl.buffered.end(0) > 1.5) {
+        if (statusOverlay.textContent.includes("Carregando buffer")) {
+          statusOverlay.style.display = "none";
+        }
+      }
+    }
 
-        if (isHost && localStream) {
-          guests.forEach((guest) => {
-            if (!activeCalls.has(guest.peerId)) {
-              const call = peer.call(guest.peerId, localStream, { sdpTransform: boostSDP });
-              boostCallQuality(call);
-              activeCalls.set(guest.peerId, call);
+    function processAppendQueue(trackId) {
+      const sb = sourceBuffers[trackId];
+      const queue = appendQueues[trackId];
+      if (!sb || sb.updating || !queue || queue.length === 0) return;
+
+      const nextBuf = queue.shift();
+      try {
+        sb.appendBuffer(nextBuf);
+      } catch (e) {
+        console.warn("Erro ao inserir buffer MSE:", e);
+      }
+    }
+
+    function requestNextSegment(trackId) {
+      const meta = guestTrackMeta[trackId];
+      if (!meta || meta.nextSegmentToRequest >= meta.totalSegments) return;
+
+      const idx = meta.nextSegmentToRequest++;
+      if (hostConnection && hostConnection.open) {
+        hostConnection.send({
+          type: "REQ_SEGMENT",
+          trackId: trackId,
+          segIndex: idx
+        });
+      }
+    }
+
+    function fillAheadBuffer(trackId) {
+      const sb = sourceBuffers[trackId];
+      const meta = guestTrackMeta[trackId];
+      if (!sb || !meta || meta.nextSegmentToRequest >= meta.totalSegments) return;
+
+      let bufferedEnd = 0;
+      for (let i = 0; i < sb.buffered.length; i++) {
+        if (videoEl.currentTime >= sb.buffered.start(i) - 1 && videoEl.currentTime <= sb.buffered.end(i) + 1) {
+          bufferedEnd = sb.buffered.end(i);
+          break;
+        }
+      }
+      if (bufferedEnd === 0 && sb.buffered.length > 0) {
+        bufferedEnd = sb.buffered.end(sb.buffered.length - 1);
+      }
+
+      // Mantém sempre pelo menos 25 segundos de filme adiantados no buffer
+      if (bufferedEnd - videoEl.currentTime < 25 && appendQueues[trackId].length < 4) {
+        requestNextSegment(trackId);
+      }
+    }
+
+    // Escuta Play / Pause / Seek do Host via Firestore
+    function listenToHostPlayback() {
+      onSnapshot(doc(db, "salas", currentRoomId), (snap) => {
+        if (!snap.exists()) return;
+        const data = snap.data();
+        const pb = data.playback;
+        if (!pb) return;
+
+        // Se o Host pulou para uma parte ainda não baixada no buffer, ajusta o índice de pedido
+        if (Math.abs(videoEl.currentTime - pb.currentTime) > 2.5) {
+          Object.values(guestTrackMeta).forEach((meta) => {
+            if (meta.duration > 0 && meta.totalSegments > 0) {
+              const targetIdx = Math.floor((pb.currentTime / meta.duration) * meta.totalSegments);
+              meta.nextSegmentToRequest = Math.max(0, Math.min(targetIdx, meta.totalSegments - 1));
             }
           });
+          videoEl.currentTime = pb.currentTime;
+        }
+
+        if (pb.isPlaying && videoEl.paused) {
+          videoEl.play().then(() => {
+            statusOverlay.style.display = "none";
+          }).catch(() => {
+            videoEl.muted = true;
+            videoEl.play();
+            statusOverlay.style.display = "block";
+            statusOverlay.textContent = "Toque no vídeo para ativar o áudio original 🔊";
+          });
+        } else if (!pb.isPlaying && !videoEl.paused) {
+          videoEl.pause();
         }
       });
     }
 
+    // =========================================================================
+    // 5. CHAT E UTILITÁRIOS
+    // =========================================================================
     function listenToChat() {
       const q = query(
         collection(db, "salas", currentRoomId, "mensagens"),
@@ -804,9 +959,6 @@
       });
     }
 
-    // =========================================================================
-    // 7. UTILITÁRIOS DE INTERFACE
-    // =========================================================================
     function enterCinemaUI() {
       lobbyScreen.style.display = "none";
       cinemaScreen.style.display = "grid";
