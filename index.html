@@ -143,7 +143,24 @@
     .host-controls {
       display: flex;
       align-items: center;
-      gap: 10px;
+      gap: 12px;
+    }
+
+    .gain-control {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 0.8rem;
+      color: var(--text-muted);
+      background: var(--bg-input);
+      padding: 5px 10px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+    }
+    .gain-control input[type="range"] {
+      width: 70px;
+      accent-color: var(--accent);
+      cursor: pointer;
     }
 
     .file-label {
@@ -282,7 +299,7 @@
 
       <div class="form-group">
         <label for="username-input">Seu Apelido</label>
-        <input type="text" id="username-input" placeholder="Ex: thor" maxlength="20" />
+        <input type="text" id="username-input" placeholder="Ex: Doom" maxlength="20" />
       </div>
 
       <button class="btn btn-primary" id="create-room-btn">Criar Nova Sala (Host)</button>
@@ -308,6 +325,11 @@
         </div>
 
         <div class="host-controls" id="host-controls" style="display: none;">
+          <div class="gain-control" title="Ganho de áudio enviado para os convidados">
+            <span>🔊 Ganho:</span>
+            <input type="range" id="stream-gain-slider" min="0.5" max="2.5" step="0.1" value="1.3" />
+            <span id="stream-gain-val">130%</span>
+          </div>
           <label for="video-file-input" class="file-label">📁 Escolher Vídeo Local</label>
           <input type="file" id="video-file-input" accept="video/mp4,video/webm,video/ogg,video/x-matroska" />
         </div>
@@ -366,6 +388,12 @@
     let localStream = null;
     const activeCalls = new Map();
 
+    // Web Audio API (Mantém o áudio contínuo e imune a seek/avanço)
+    let audioCtx = null;
+    let audioSourceNode = null;
+    let audioGainNode = null;
+    let audioDestNode = null;
+
     // Elementos DOM
     const lobbyScreen = document.getElementById("lobby-screen");
     const cinemaScreen = document.getElementById("cinema-screen");
@@ -382,11 +410,22 @@
     const chatForm = document.getElementById("chat-form");
     const chatInput = document.getElementById("chat-input");
     const viewersCount = document.getElementById("viewers-count");
+    const gainSlider = document.getElementById("stream-gain-slider");
+    const gainVal = document.getElementById("stream-gain-val");
 
     const urlParams = new URLSearchParams(window.location.search);
     if (urlParams.get("sala")) {
       roomCodeInput.value = urlParams.get("sala").toUpperCase();
     }
+
+    // Controle de Ganho de Áudio em Tempo Real
+    gainSlider.addEventListener("input", () => {
+      const val = parseFloat(gainSlider.value);
+      gainVal.textContent = `${Math.round(val * 100)}%`;
+      if (audioGainNode) {
+        audioGainNode.gain.value = val;
+      }
+    });
 
     // =========================================================================
     // 2. SDP LIMPO PARA VÍDEO HD E ÁUDIO ESTÉREO
@@ -542,30 +581,75 @@
     });
 
     // =========================================================================
-    // 5. CAPTURA E TRANSMISSÃO DO VÍDEO E ÁUDIO ESTÉREO (HOST)
+    // 5. CAPTURA BLINDADA DE ÁUDIO (WEB AUDIO API) + VÍDEO HD (HOST)
     // =========================================================================
-    async function applyHighQualityTracks(stream) {
-      const videoTrack = stream.getVideoTracks()[0];
+    function buildStableMediaStream(videoElement) {
+      // 1. Captura apenas o vídeo da tag <video>
+      const rawStream = videoElement.captureStream
+        ? videoElement.captureStream()
+        : videoElement.mozCaptureStream();
+
+      const videoTrack = rawStream.getVideoTracks()[0];
       if (videoTrack && "contentHint" in videoTrack) {
         videoTrack.contentHint = "detail";
       }
 
-      const audioTrack = stream.getAudioTracks()[0];
-      if (audioTrack) {
-        if ("contentHint" in audioTrack) {
-          audioTrack.contentHint = "music";
-        }
-        try {
-          await audioTrack.applyConstraints({
-            echoCancellation: false,
-            noiseSuppression: false,
-            autoGainControl: false
-          });
-        } catch (e) {
-          console.warn("Constraints de áudio ignoradas:", e);
-        }
+      // 2. Roteia o áudio pelo AudioContext para não quebrar ao mudar o tempo (seek)
+      if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        audioSourceNode = audioCtx.createMediaElementSource(videoElement);
+        audioGainNode = audioCtx.createGain();
+        audioDestNode = audioCtx.createMediaStreamDestination();
+
+        audioGainNode.gain.value = parseFloat(gainSlider.value);
+
+        // Envia para os convidados (com ganho ajustável) E para os alto-falantes locais do PC
+        audioSourceNode.connect(audioGainNode);
+        audioGainNode.connect(audioDestNode);
+        audioSourceNode.connect(audioCtx.destination);
       }
+
+      if (audioCtx.state === "suspended") {
+        audioCtx.resume();
+      }
+
+      const cleanAudioTrack = audioDestNode.stream.getAudioTracks()[0];
+      if (cleanAudioTrack && "contentHint" in cleanAudioTrack) {
+        cleanAudioTrack.contentHint = "music";
+      }
+
+      // 3. Combina vídeo HD + áudio contínuo estabilizado
+      const combinedStream = new MediaStream();
+      if (videoTrack) combinedStream.addTrack(videoTrack);
+      if (cleanAudioTrack) combinedStream.addTrack(cleanAudioTrack);
+
+      return combinedStream;
     }
+
+    // Garante que o AudioContext nunca durma quando você avança/volta o filme
+    videoEl.addEventListener("seeked", () => {
+      if (!isHost) return;
+      if (audioCtx && audioCtx.state === "suspended") {
+        audioCtx.resume();
+      }
+      // Atualiza as trilhas nas conexões ativas para evitar dessincronia pós-seek
+      if (localStream) {
+        const videoTrack = localStream.getVideoTracks()[0];
+        const audioTrack = localStream.getAudioTracks()[0];
+        activeCalls.forEach((call) => {
+          const pc = call.peerConnection;
+          if (!pc) return;
+          pc.getSenders().forEach((sender) => {
+            if (sender.track && sender.track.kind === "video" && videoTrack) {
+              sender.replaceTrack(videoTrack).catch(() => {});
+            }
+            if (sender.track && sender.track.kind === "audio" && audioTrack) {
+              sender.replaceTrack(audioTrack).catch(() => {});
+            }
+          });
+        });
+      }
+    });
 
     function preferH264Codec(pc) {
       try {
@@ -624,16 +708,12 @@
       statusOverlay.style.display = "none";
 
       videoEl.onloadedmetadata = async () => {
-        videoEl.play();
-        if (videoEl.captureStream) {
-          localStream = videoEl.captureStream();
-        } else if (videoEl.mozCaptureStream) {
-          localStream = videoEl.mozCaptureStream();
-        } else {
+        await videoEl.play();
+        if (!videoEl.captureStream && !videoEl.mozCaptureStream) {
           return alert("Seu navegador não suporta captureStream(). Use Chrome ou Edge.");
         }
 
-        await applyHighQualityTracks(localStream);
+        localStream = buildStableMediaStream(videoEl);
         broadcastStreamToAllGuests();
         sendSystemMessage(`🎬 Filme carregado: ${file.name}`);
       };
