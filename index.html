@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Sala de Cinema — P2P Stream Original</title>
+  <title>Sala de Cinema — P2P Stream Sincronizado</title>
   <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/mp4box@0.5.2/dist/mp4box.all.min.js"></script>
   <style>
@@ -190,12 +190,13 @@
       position: absolute;
       text-align: center;
       color: var(--text-main);
-      background: rgba(0, 0, 0, 0.8);
+      background: rgba(0, 0, 0, 0.82);
       padding: 12px 20px;
       border-radius: 8px;
       pointer-events: none;
       font-size: 0.95rem;
       max-width: 85%;
+      z-index: 10;
     }
 
     /* Chat Lateral */
@@ -290,11 +291,11 @@
   <div id="lobby-screen">
     <div class="lobby-card">
       <h1>🍿 Sala de Cinema</h1>
-      <p>Streaming P2P direto do arquivo MP4 com 100% da qualidade original.</p>
+      <p>Streaming P2P direto do arquivo MP4 com carregamento sincronizado.</p>
 
       <div class="form-group">
         <label for="username-input">Seu Apelido</label>
-        <input type="text" id="username-input" placeholder="Ex: Vácuo" maxlength="20" />
+        <input type="text" id="username-input" placeholder="Ex: Kang" maxlength="20" />
       </div>
 
       <button class="btn btn-primary" id="create-room-btn">Criar Nova Sala (Host)</button>
@@ -381,12 +382,18 @@
     let currentUser = "";
     let isHost = false;
 
-    // Variáveis do Host
+    // Variáveis do Host (Incluindo Barreira de Sincronização de Seek)
     let mediaReady = false;
     let mediaMeta = null;
     const guestConnections = new Map();
     const guestSendQueues = new Map();
     const guestSendingFlags = new Map();
+
+    let hostIsWaitingForGuests = false;
+    let hostSeekEpoch = 0;
+    let pendingReadyGuests = new Set();
+    let hostSeekTimeout = null;
+    let wasPlayingBeforeSeek = false;
 
     // Variáveis do Convidado
     let hostConnection = null;
@@ -398,6 +405,8 @@
     let incomingChunks = {};
     let currentSeekEpoch = 0;
     let pendingSeekTarget = null;
+    let guestReportedReadyForEpoch = -1;
+    let shouldBePlaying = false;
 
     // Elementos DOM
     const lobbyScreen = document.getElementById("lobby-screen");
@@ -458,7 +467,7 @@
     }
 
     // =========================================================================
-    // 3. HOST: CRIAR SALA E ENVIAR SEGMENTOS INDEXADOS POR TEMPO REAL
+    // 3. HOST: CRIAR SALA E BARREIRA DE CARREGAMENTO SINCRONIZADO
     // =========================================================================
     createRoomBtn.addEventListener("click", async () => {
       const name = usernameInput.value.trim();
@@ -492,6 +501,8 @@
               enqueueSegmentForGuest(conn, msg.trackId, msg.segIndex, msg.epoch);
             } else if (msg.type === "CLEAR_QUEUE") {
               guestSendQueues.set(conn.peer, []);
+            } else if (msg.type === "GUEST_READY") {
+              handleGuestReadySignal(conn.peer, msg.epoch);
             }
           });
 
@@ -499,6 +510,8 @@
             guestConnections.delete(conn.peer);
             guestSendQueues.delete(conn.peer);
             guestSendingFlags.delete(conn.peer);
+            pendingReadyGuests.delete(conn.peer);
+            checkAllGuestsReady();
             updateOnlineCount();
           });
         });
@@ -506,7 +519,7 @@
         await setDoc(doc(db, "salas", currentRoomId), {
           hostPeerId: myPeerId,
           hostName: currentUser,
-          playback: { isPlaying: false, currentTime: 0, seekId: 0, updatedAt: Date.now() },
+          playback: { isPlaying: false, currentTime: 0, seekId: 0, buffering: false, updatedAt: Date.now() },
           createdAt: serverTimestamp()
         });
 
@@ -612,7 +625,6 @@
           const track = tracksMap[id];
           if (!track) return;
 
-          // Calcula o segundo exato de início deste segmento
           const approxStartTime = sampleNumber * track.avgSampleDuration;
           track.segments.push({
             index: track.segments.length,
@@ -655,6 +667,8 @@
       conn.send({
         type: "INIT_MANIFEST",
         duration: mediaMeta.duration,
+        currentTime: videoEl.currentTime,
+        isPlaying: !videoEl.paused,
         tracks: mediaMeta.tracks.map((t) => ({
           id: t.id,
           type: t.type,
@@ -662,7 +676,7 @@
           width: t.width,
           height: t.height,
           totalSegments: t.segments.length,
-          segmentTimes: t.segments.map((s) => s.startTime), // Mapa exato de segundos por segmento
+          segmentTimes: t.segments.map((s) => s.startTime),
           initBuffer: t.initBuffer
         }))
       });
@@ -732,29 +746,136 @@
       pump();
     }
 
+    // =========================================================================
+    // CONTROLE DE BARREIRA DE SEEK NO HOST (ESPERA O CELULAR CARREGAR)
+    // =========================================================================
     function setupHostPlaybackSync() {
       const roomRef = doc(db, "salas", currentRoomId);
-      let seekCounter = 0;
 
-      const syncState = (isSeek = false) => {
-        if (isSeek) seekCounter++;
+      const pushPlaybackDoc = (isPlaying, currentTime, buffering) => {
         updateDoc(roomRef, {
           playback: {
-            isPlaying: !videoEl.paused,
-            currentTime: videoEl.currentTime,
-            seekId: seekCounter,
+            isPlaying: isPlaying,
+            currentTime: currentTime,
+            seekId: hostSeekEpoch,
+            buffering: buffering,
             updatedAt: Date.now()
           }
         }).catch(() => {});
       };
 
-      videoEl.addEventListener("play", () => syncState(false));
-      videoEl.addEventListener("pause", () => syncState(false));
-      videoEl.addEventListener("seeked", () => syncState(true));
+      // Guarda se estava tocando antes do usuário arrastar a barra
+      videoEl.addEventListener("seeking", () => {
+        if (!hostIsWaitingForGuests) {
+          wasPlayingBeforeSeek = !videoEl.paused;
+        }
+      });
+
+      // Quando o usuário solta a barra de tempo no PC:
+      videoEl.addEventListener("seeked", () => {
+        const targetTime = videoEl.currentTime;
+        const activeGuests = Array.from(guestConnections.values()).filter((c) => c.open);
+
+        hostSeekEpoch++;
+
+        // Se não há convidados conectados, segue normal sem esperar
+        if (activeGuests.length === 0) {
+          pushPlaybackDoc(!videoEl.paused, targetTime, false);
+          return;
+        }
+
+        // Pausa o PC imediatamente e espera os convidados carregarem o novo ponto
+        hostIsWaitingForGuests = true;
+        videoEl.pause();
+        pendingReadyGuests = new Set(activeGuests.map((c) => c.peer));
+
+        statusOverlay.style.display = "block";
+        statusOverlay.textContent = "⏳ Aguardando participantes carregarem a nova cena...";
+
+        // Limpa filas antigas e envia comando direto de SEEK pelo canal P2P
+        activeGuests.forEach((conn) => {
+          guestSendQueues.set(conn.peer, []);
+          conn.send({
+            type: "SYNC_SEEK",
+            targetTime: targetTime,
+            epoch: hostSeekEpoch,
+            resumeAfter: wasPlayingBeforeSeek
+          });
+        });
+
+        pushPlaybackDoc(false, targetTime, true);
+
+        // Timeout de segurança (7s) para nunca travar o PC se a internet de alguém cair
+        clearTimeout(hostSeekTimeout);
+        hostSeekTimeout = setTimeout(() => {
+          if (hostIsWaitingForGuests) {
+            finishHostSeekBarrier();
+          }
+        }, 7000);
+      });
+
+      videoEl.addEventListener("play", () => {
+        if (hostIsWaitingForGuests) return;
+        statusOverlay.style.display = "none";
+        pushPlaybackDoc(true, videoEl.currentTime, false);
+      });
+
+      videoEl.addEventListener("pause", () => {
+        if (hostIsWaitingForGuests) return;
+        pushPlaybackDoc(false, videoEl.currentTime, false);
+      });
+    }
+
+    function handleGuestReadySignal(peerId, epoch) {
+      if (!hostIsWaitingForGuests || epoch !== hostSeekEpoch) return;
+      pendingReadyGuests.delete(peerId);
+      checkAllGuestsReady();
+    }
+
+    function checkAllGuestsReady() {
+      if (hostIsWaitingForGuests && pendingReadyGuests.size === 0) {
+        finishHostSeekBarrier();
+      }
+    }
+
+    function finishHostSeekBarrier() {
+      clearTimeout(hostSeekTimeout);
+      hostIsWaitingForGuests = false;
+      pendingReadyGuests.clear();
+      statusOverlay.style.display = "none";
+
+      const roomRef = doc(db, "salas", currentRoomId);
+      const shouldPlay = wasPlayingBeforeSeek;
+
+      if (shouldPlay) {
+        videoEl.play().catch(() => {});
+      }
+
+      // Libera todos os convidados para darem play juntos no mesmo segundo
+      guestConnections.forEach((conn) => {
+        if (conn.open) {
+          conn.send({
+            type: "SYNC_RESUME",
+            targetTime: videoEl.currentTime,
+            isPlaying: shouldPlay,
+            epoch: hostSeekEpoch
+          });
+        }
+      });
+
+      updateDoc(roomRef, {
+        playback: {
+          isPlaying: shouldPlay,
+          currentTime: videoEl.currentTime,
+          seekId: hostSeekEpoch,
+          buffering: false,
+          updatedAt: Date.now()
+        }
+      }).catch(() => {});
     }
 
     // =========================================================================
-    // 4. CONVIDADO: SEEK PRECISO NO KEYFRAME + LIMPEZA DE BUFFER
+    // 4. CONVIDADO: CARREGAR BUFFER E AVISAR O HOST QUANDO ESTIVER PRONTO
     // =========================================================================
     joinRoomBtn.addEventListener("click", async () => {
       const name = usernameInput.value.trim();
@@ -794,10 +915,29 @@
 
         hostConnection.on("data", (msg) => {
           if (!msg || !msg.type) return;
+
           if (msg.type === "INIT_MANIFEST") {
             initGuestMediaSource(msg);
           } else if (msg.type === "SEGMENT_CHUNK") {
             handleIncomingChunk(msg);
+          } else if (msg.type === "SYNC_SEEK") {
+            // Host avançou o filme e está esperando: pausa e carrega o novo ponto
+            shouldBePlaying = msg.resumeAfter;
+            videoEl.pause();
+            resetBuffersForSeek(msg.targetTime, msg.epoch);
+          } else if (msg.type === "SYNC_RESUME") {
+            // Todos carregaram! Solta o play simultâneo
+            shouldBePlaying = msg.isPlaying;
+            pendingSeekTarget = null;
+            statusOverlay.style.display = "none";
+            if (Math.abs(videoEl.currentTime - msg.targetTime) > 1.0) {
+              videoEl.currentTime = msg.targetTime;
+            }
+            if (msg.isPlaying) {
+              playGuestVideoSafely();
+            } else {
+              videoEl.pause();
+            }
           }
         });
 
@@ -813,6 +953,17 @@
       }
     });
 
+    function playGuestVideoSafely() {
+      videoEl.play().then(() => {
+        statusOverlay.style.display = "none";
+      }).catch(() => {
+        videoEl.muted = true;
+        videoEl.play();
+        statusOverlay.style.display = "block";
+        statusOverlay.textContent = "Toque no vídeo para ativar o áudio original 🔊";
+      });
+    }
+
     function initGuestMediaSource(manifest) {
       statusOverlay.style.display = "block";
       statusOverlay.textContent = "Carregando buffer em qualidade original...";
@@ -827,7 +978,12 @@
       guestTrackMeta = {};
       inFlightRequests = {};
       incomingChunks = {};
-      currentSeekEpoch++;
+      currentSeekEpoch = 0;
+      guestReportedReadyForEpoch = -1;
+      shouldBePlaying = manifest.isPlaying ?? true;
+
+      const startPos = manifest.currentTime || 0;
+      pendingSeekTarget = startPos > 0 ? startPos : null;
 
       mediaSource = new MediaSource();
       videoEl.src = URL.createObjectURL(mediaSource);
@@ -846,18 +1002,23 @@
           sourceBuffers[track.id] = sb;
           appendQueues[track.id] = [track.initBuffer];
           inFlightRequests[track.id] = new Set();
-          guestTrackMeta[track.id] = {
+
+          const meta = {
             totalSegments: track.totalSegments,
             segmentTimes: track.segmentTimes || [],
             nextSegmentToRequest: 0,
             duration: manifest.duration,
             isCleaning: false
           };
+          if (startPos > 0) {
+            meta.nextSegmentToRequest = findSegmentIndexForTime(meta, startPos);
+          }
+          guestTrackMeta[track.id] = meta;
 
           sb.addEventListener("updateend", () => {
             guestTrackMeta[track.id].isCleaning = false;
             processAppendQueue(track.id);
-            alignVideoToLoadedBuffer(sb);
+            checkGuestBufferReadyAndNotify();
             fillAheadBuffer(track.id);
           });
 
@@ -878,26 +1039,58 @@
 
       videoEl.addEventListener("click", () => {
         if (videoEl.muted) videoEl.muted = false;
-        if (videoEl.paused) videoEl.play().catch(() => {});
-        statusOverlay.style.display = "none";
+        if (videoEl.paused && shouldBePlaying && pendingSeekTarget === null) {
+          videoEl.play().catch(() => {});
+        }
+        if (pendingSeekTarget === null) {
+          statusOverlay.style.display = "none";
+        }
       });
     }
 
-    // Se houve seek e o novo buffer começa ligeiramente antes ou depois do target, encaixa no keyframe
-    function alignVideoToLoadedBuffer(sb) {
-      if (pendingSeekTarget === null || sb.buffered.length === 0) return;
+    // Verifica se todas as faixas (vídeo + áudio) já têm buffer no ponto desejado e avisa o Host
+    function checkGuestBufferReadyAndNotify() {
+      const sbList = Object.values(sourceBuffers);
+      if (sbList.length === 0) return;
 
-      const bufStart = sb.buffered.start(0);
-      const bufEnd = sb.buffered.end(sb.buffered.length - 1);
+      let allReady = true;
+      let commonStart = 0;
+      let commonEnd = Infinity;
 
-      if (bufEnd - bufStart > 0.5) {
-        if (videoEl.currentTime < bufStart || videoEl.currentTime > bufEnd) {
-          videoEl.currentTime = Math.max(bufStart, Math.min(pendingSeekTarget, bufEnd - 0.1));
+      for (const sb of sbList) {
+        if (sb.buffered.length === 0) {
+          allReady = false;
+          break;
         }
-        pendingSeekTarget = null;
-        statusOverlay.style.display = "none";
-        if (videoEl.paused && shouldBePlaying) {
-          videoEl.play().catch(() => {});
+        const s = sb.buffered.start(0);
+        const e = sb.buffered.end(sb.buffered.length - 1);
+        commonStart = Math.max(commonStart, s);
+        commonEnd = Math.min(commonEnd, e);
+      }
+
+      // Exige pelo menos 1.5s de vídeo+áudio prontos no buffer
+      if (allReady && (commonEnd - commonStart) >= 1.5) {
+        if (pendingSeekTarget !== null) {
+          const clampedTime = Math.max(commonStart, Math.min(pendingSeekTarget, commonEnd - 0.1));
+          videoEl.currentTime = clampedTime;
+          pendingSeekTarget = null;
+        }
+
+        // Envia confirmação GUEST_READY para o PC liberar o play simultâneo
+        if (guestReportedReadyForEpoch !== currentSeekEpoch) {
+          guestReportedReadyForEpoch = currentSeekEpoch;
+          if (hostConnection && hostConnection.open) {
+            hostConnection.send({
+              type: "GUEST_READY",
+              epoch: currentSeekEpoch
+            });
+          }
+          statusOverlay.textContent = "Pronto! Aguardando início sincronizado...";
+          // Se o filme já estava rodando (ex: entrou no meio da sessão), inicia direto
+          if (currentSeekEpoch === 0 && shouldBePlaying) {
+            statusOverlay.style.display = "none";
+            playGuestVideoSafely();
+          }
         }
       }
     }
@@ -938,13 +1131,6 @@
         if (appendQueues[msg.trackId]) {
           appendQueues[msg.trackId].push(merged.buffer);
           processAppendQueue(msg.trackId);
-        }
-
-        if (videoEl.buffered.length > 0) {
-          const bufEnd = videoEl.buffered.end(videoEl.buffered.length - 1);
-          if (bufEnd - videoEl.currentTime > 1.0 && pendingSeekTarget === null) {
-            statusOverlay.style.display = "none";
-          }
         }
       }
     }
@@ -1018,7 +1204,6 @@
       }
     }
 
-    // Encontra o índice exato do segmento cujo tempo inicial é <= targetTime
     function findSegmentIndexForTime(meta, targetTime) {
       const times = meta.segmentTimes;
       if (!times || times.length === 0) {
@@ -1036,12 +1221,11 @@
           break;
         }
       }
-      // Recua 1 segmento extra de segurança para garantir o keyframe anterior
       return Math.max(0, foundIdx - 1);
     }
 
-    function resetBuffersForSeek(targetTime) {
-      currentSeekEpoch++;
+    function resetBuffersForSeek(targetTime, newEpoch) {
+      currentSeekEpoch = newEpoch;
       incomingChunks = {};
       pendingSeekTarget = targetTime;
 
@@ -1050,7 +1234,7 @@
       }
 
       statusOverlay.style.display = "block";
-      statusOverlay.textContent = "Sincronizando cena...";
+      statusOverlay.textContent = "⏳ Carregando nova cena (aguardando sincronia)...";
 
       Object.keys(sourceBuffers).forEach((idStr) => {
         const trackId = Number(idStr);
@@ -1073,15 +1257,11 @@
         setTimeout(() => {
           requestNextSegment(trackId);
           requestNextSegment(trackId);
-        }, 60);
+        }, 50);
       });
-
-      videoEl.currentTime = targetTime;
     }
 
-    let lastSeekId = -1;
-    let shouldBePlaying = false;
-
+    // Escuta Play / Pause normal pelo Firestore (sem disparar reset de seek em loop)
     function listenToHostPlayback() {
       onSnapshot(doc(db, "salas", currentRoomId), (snap) => {
         if (!snap.exists()) return;
@@ -1091,22 +1271,14 @@
 
         shouldBePlaying = pb.isPlaying;
 
-        const seekChanged = pb.seekId !== undefined && pb.seekId !== lastSeekId && lastSeekId !== -1;
-        lastSeekId = pb.seekId ?? 0;
-
-        if (seekChanged || Math.abs(videoEl.currentTime - pb.currentTime) > 3.5) {
-          resetBuffersForSeek(pb.currentTime);
+        // Se o Host está na barreira esperando o buffer, mantém pausado
+        if (pb.buffering) {
+          if (!videoEl.paused) videoEl.pause();
+          return;
         }
 
-        if (pb.isPlaying && videoEl.paused) {
-          videoEl.play().then(() => {
-            if (pendingSeekTarget === null) statusOverlay.style.display = "none";
-          }).catch(() => {
-            videoEl.muted = true;
-            videoEl.play();
-            statusOverlay.style.display = "block";
-            statusOverlay.textContent = "Toque no vídeo para ativar o áudio original 🔊";
-          });
+        if (pb.isPlaying && videoEl.paused && pendingSeekTarget === null) {
+          playGuestVideoSafely();
         } else if (!pb.isPlaying && !videoEl.paused) {
           videoEl.pause();
         }
