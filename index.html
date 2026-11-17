@@ -295,7 +295,7 @@
 
       <div class="form-group">
         <label for="username-input">Seu Apelido</label>
-        <input type="text" id="username-input" placeholder="Ex: Kang" maxlength="20" />
+        <input type="text" id="username-input" placeholder="Ex: Pedro" maxlength="20" />
       </div>
 
       <button class="btn btn-primary" id="create-room-btn">Criar Nova Sala (Host)</button>
@@ -371,18 +371,16 @@
     const app = initializeApp(firebaseConfig);
     const db = getFirestore(app);
 
-    // Constantes de Controle de Vazão WebRTC
-    const PACKET_SIZE = 64 * 1024;
+    const PACKET_SIZE = 32 * 1024; // 32 KB por pacote (seguro para qualquer navegador mobile)
     const MAX_BUFFERED_AMOUNT = 512 * 1024;
 
-    // Variáveis de Estado Geral
     let peer = null;
     let myPeerId = null;
     let currentRoomId = null;
     let currentUser = "";
     let isHost = false;
 
-    // Variáveis do Host (Incluindo Barreira de Sincronização de Seek)
+    // Host
     let mediaReady = false;
     let mediaMeta = null;
     const guestConnections = new Map();
@@ -395,7 +393,7 @@
     let hostSeekTimeout = null;
     let wasPlayingBeforeSeek = false;
 
-    // Variáveis do Convidado
+    // Convidado
     let hostConnection = null;
     let mediaSource = null;
     let sourceBuffers = {};
@@ -407,8 +405,10 @@
     let pendingSeekTarget = null;
     let guestReportedReadyForEpoch = -1;
     let shouldBePlaying = false;
+    let manifestReceived = false;
+    let manifestRetryTimer = null;
 
-    // Elementos DOM
+    // DOM
     const lobbyScreen = document.getElementById("lobby-screen");
     const cinemaScreen = document.getElementById("cinema-screen");
     const usernameInput = document.getElementById("username-input");
@@ -467,7 +467,7 @@
     }
 
     // =========================================================================
-    // 3. HOST: CRIAR SALA E BARREIRA DE CARREGAMENTO SINCRONIZADO
+    // 3. HOST
     // =========================================================================
     createRoomBtn.addEventListener("click", async () => {
       const name = usernameInput.value.trim();
@@ -489,15 +489,13 @@
           guestSendingFlags.set(conn.peer, false);
           updateOnlineCount();
 
-          conn.on("open", () => {
-            if (mediaReady && mediaMeta) {
-              sendInitManifestToGuest(conn);
-            }
-          });
-
           conn.on("data", (msg) => {
             if (!msg) return;
-            if (msg.type === "REQ_SEGMENT") {
+            if (msg.type === "REQ_MANIFEST") {
+              if (mediaReady && mediaMeta) {
+                sendInitManifestToGuest(conn);
+              }
+            } else if (msg.type === "REQ_SEGMENT") {
               enqueueSegmentForGuest(conn, msg.trackId, msg.segIndex, msg.epoch);
             } else if (msg.type === "CLEAR_QUEUE") {
               guestSendQueues.set(conn.peer, []);
@@ -519,6 +517,7 @@
         await setDoc(doc(db, "salas", currentRoomId), {
           hostPeerId: myPeerId,
           hostName: currentUser,
+          onlineCount: 1,
           playback: { isPlaying: false, currentTime: 0, seekId: 0, buffering: false, updatedAt: Date.now() },
           createdAt: serverTimestamp()
         });
@@ -540,7 +539,11 @@
     });
 
     function updateOnlineCount() {
-      viewersCount.textContent = `${guestConnections.size + 1} online`;
+      const total = guestConnections.size + 1;
+      viewersCount.textContent = `${total} online`;
+      if (isHost && currentRoomId) {
+        updateDoc(doc(db, "salas", currentRoomId), { onlineCount: total }).catch(() => {});
+      }
     }
 
     videoFileInput.addEventListener("change", async (e) => {
@@ -663,9 +666,13 @@
       });
     }
 
+    // Envia o manifesto leve + fatia os initBuffers em pacotes de 32 KB para não estourar WebRTC
     function sendInitManifestToGuest(conn) {
-      conn.send({
-        type: "INIT_MANIFEST",
+      const queue = guestSendQueues.get(conn.peer) || [];
+      guestSendQueues.set(conn.peer, queue);
+
+      queue.push({
+        type: "INIT_MANIFEST_META",
         duration: mediaMeta.duration,
         currentTime: videoEl.currentTime,
         isPlaying: !videoEl.paused,
@@ -676,10 +683,27 @@
           width: t.width,
           height: t.height,
           totalSegments: t.segments.length,
-          segmentTimes: t.segments.map((s) => s.startTime),
-          initBuffer: t.initBuffer
+          segmentTimes: t.segments.map((s) => s.startTime)
         }))
       });
+
+      // Envia cada initBuffer usando o mesmo sistema de chunks (segIndex = -1)
+      mediaMeta.tracks.forEach((t) => {
+        const totalParts = Math.ceil(t.initBuffer.byteLength / PACKET_SIZE);
+        for (let partIdx = 0; partIdx < totalParts; partIdx++) {
+          const start = partIdx * PACKET_SIZE;
+          const end = Math.min(start + PACKET_SIZE, t.initBuffer.byteLength);
+          queue.push({
+            type: "INIT_CHUNK",
+            trackId: t.id,
+            partIdx: partIdx,
+            totalParts: totalParts,
+            chunk: t.initBuffer.slice(start, end)
+          });
+        }
+      });
+
+      drainGuestSendQueue(conn);
     }
 
     function enqueueSegmentForGuest(conn, trackId, segIndex, epoch) {
@@ -746,9 +770,6 @@
       pump();
     }
 
-    // =========================================================================
-    // CONTROLE DE BARREIRA DE SEEK NO HOST (ESPERA O CELULAR CARREGAR)
-    // =========================================================================
     function setupHostPlaybackSync() {
       const roomRef = doc(db, "salas", currentRoomId);
 
@@ -764,27 +785,23 @@
         }).catch(() => {});
       };
 
-      // Guarda se estava tocando antes do usuário arrastar a barra
       videoEl.addEventListener("seeking", () => {
         if (!hostIsWaitingForGuests) {
           wasPlayingBeforeSeek = !videoEl.paused;
         }
       });
 
-      // Quando o usuário solta a barra de tempo no PC:
       videoEl.addEventListener("seeked", () => {
         const targetTime = videoEl.currentTime;
         const activeGuests = Array.from(guestConnections.values()).filter((c) => c.open);
 
         hostSeekEpoch++;
 
-        // Se não há convidados conectados, segue normal sem esperar
         if (activeGuests.length === 0) {
           pushPlaybackDoc(!videoEl.paused, targetTime, false);
           return;
         }
 
-        // Pausa o PC imediatamente e espera os convidados carregarem o novo ponto
         hostIsWaitingForGuests = true;
         videoEl.pause();
         pendingReadyGuests = new Set(activeGuests.map((c) => c.peer));
@@ -792,7 +809,6 @@
         statusOverlay.style.display = "block";
         statusOverlay.textContent = "⏳ Aguardando participantes carregarem a nova cena...";
 
-        // Limpa filas antigas e envia comando direto de SEEK pelo canal P2P
         activeGuests.forEach((conn) => {
           guestSendQueues.set(conn.peer, []);
           conn.send({
@@ -805,7 +821,6 @@
 
         pushPlaybackDoc(false, targetTime, true);
 
-        // Timeout de segurança (7s) para nunca travar o PC se a internet de alguém cair
         clearTimeout(hostSeekTimeout);
         hostSeekTimeout = setTimeout(() => {
           if (hostIsWaitingForGuests) {
@@ -851,7 +866,6 @@
         videoEl.play().catch(() => {});
       }
 
-      // Libera todos os convidados para darem play juntos no mesmo segundo
       guestConnections.forEach((conn) => {
         if (conn.open) {
           conn.send({
@@ -875,8 +889,11 @@
     }
 
     // =========================================================================
-    // 4. CONVIDADO: CARREGAR BUFFER E AVISAR O HOST QUANDO ESTIVER PRONTO
+    // 4. CONVIDADO
     // =========================================================================
+    let pendingManifestMeta = null;
+    let incomingInitChunks = {};
+
     joinRoomBtn.addEventListener("click", async () => {
       const name = usernameInput.value.trim();
       const code = roomCodeInput.value.trim().toUpperCase();
@@ -904,29 +921,26 @@
 
         hostConnection = peer.connect(hostPeerId, { reliable: true });
 
-        hostConnection.on("open", () => {
-          enterCinemaUI();
-          videoEl.controls = true;
-          statusOverlay.textContent = "Conectado! Aguardando o Host iniciar o filme...";
-          sendSystemMessage(`${currentUser} entrou na sala.`);
-          listenToHostPlayback();
-          listenToChat();
-        });
-
+        // Registra o listener de dados ANTES de abrir para nunca perder a primeira mensagem
         hostConnection.on("data", (msg) => {
           if (!msg || !msg.type) return;
 
-          if (msg.type === "INIT_MANIFEST") {
-            initGuestMediaSource(msg);
+          if (msg.type === "INIT_MANIFEST_META") {
+            manifestReceived = true;
+            clearInterval(manifestRetryTimer);
+            pendingManifestMeta = msg;
+            incomingInitChunks = {};
+            statusOverlay.style.display = "block";
+            statusOverlay.textContent = "Recebendo cabeçalho do vídeo...";
+          } else if (msg.type === "INIT_CHUNK") {
+            handleIncomingInitChunk(msg);
           } else if (msg.type === "SEGMENT_CHUNK") {
             handleIncomingChunk(msg);
           } else if (msg.type === "SYNC_SEEK") {
-            // Host avançou o filme e está esperando: pausa e carrega o novo ponto
             shouldBePlaying = msg.resumeAfter;
             videoEl.pause();
             resetBuffersForSeek(msg.targetTime, msg.epoch);
           } else if (msg.type === "SYNC_RESUME") {
-            // Todos carregaram! Solta o play simultâneo
             shouldBePlaying = msg.isPlaying;
             pendingSeekTarget = null;
             statusOverlay.style.display = "none";
@@ -941,7 +955,27 @@
           }
         });
 
+        hostConnection.on("open", () => {
+          enterCinemaUI();
+          videoEl.controls = true;
+          statusOverlay.textContent = "Conectado! Solicitando filme ao Host...";
+          sendSystemMessage(`${currentUser} entrou na sala.`);
+          listenToHostPlayback();
+          listenToChat();
+
+          // Pede o manifesto imediatamente e insiste a cada 2.5s até receber
+          hostConnection.send({ type: "REQ_MANIFEST" });
+          manifestRetryTimer = setInterval(() => {
+            if (!manifestReceived && hostConnection && hostConnection.open) {
+              hostConnection.send({ type: "REQ_MANIFEST" });
+            } else {
+              clearInterval(manifestRetryTimer);
+            }
+          }, 2500);
+        });
+
         hostConnection.on("close", () => {
+          clearInterval(manifestRetryTimer);
           statusOverlay.style.display = "block";
           statusOverlay.textContent = "Conexão com o Host encerrada.";
         });
@@ -952,6 +986,49 @@
         joinRoomBtn.textContent = "Entrar como Convidado";
       }
     });
+
+    function handleIncomingInitChunk(msg) {
+      if (!pendingManifestMeta) return;
+      if (!incomingInitChunks[msg.trackId]) {
+        incomingInitChunks[msg.trackId] = {
+          total: msg.totalParts,
+          received: 0,
+          parts: new Array(msg.totalParts)
+        };
+      }
+
+      const entry = incomingInitChunks[msg.trackId];
+      if (!entry.parts[msg.partIdx]) {
+        entry.parts[msg.partIdx] = msg.chunk;
+        entry.received++;
+      }
+
+      // Verifica se todas as faixas terminaram de receber o initBuffer
+      const allTracksComplete = pendingManifestMeta.tracks.every((t) => {
+        const e = incomingInitChunks[t.id];
+        return e && e.received === e.total;
+      });
+
+      if (allTracksComplete) {
+        const assembledTracks = pendingManifestMeta.tracks.map((t) => {
+          const e = incomingInitChunks[t.id];
+          let totalBytes = 0;
+          for (const p of e.parts) totalBytes += p.byteLength;
+          const merged = new Uint8Array(totalBytes);
+          let offset = 0;
+          for (const p of e.parts) {
+            merged.set(new Uint8Array(p), offset);
+            offset += p.byteLength;
+          }
+          return { ...t, initBuffer: merged.buffer };
+        });
+
+        const fullManifest = { ...pendingManifestMeta, tracks: assembledTracks };
+        pendingManifestMeta = null;
+        incomingInitChunks = {};
+        initGuestMediaSource(fullManifest);
+      }
+    }
 
     function playGuestVideoSafely() {
       videoEl.play().then(() => {
@@ -1048,7 +1125,6 @@
       });
     }
 
-    // Verifica se todas as faixas (vídeo + áudio) já têm buffer no ponto desejado e avisa o Host
     function checkGuestBufferReadyAndNotify() {
       const sbList = Object.values(sourceBuffers);
       if (sbList.length === 0) return;
@@ -1068,7 +1144,6 @@
         commonEnd = Math.min(commonEnd, e);
       }
 
-      // Exige pelo menos 1.5s de vídeo+áudio prontos no buffer
       if (allReady && (commonEnd - commonStart) >= 1.5) {
         if (pendingSeekTarget !== null) {
           const clampedTime = Math.max(commonStart, Math.min(pendingSeekTarget, commonEnd - 0.1));
@@ -1076,7 +1151,6 @@
           pendingSeekTarget = null;
         }
 
-        // Envia confirmação GUEST_READY para o PC liberar o play simultâneo
         if (guestReportedReadyForEpoch !== currentSeekEpoch) {
           guestReportedReadyForEpoch = currentSeekEpoch;
           if (hostConnection && hostConnection.open) {
@@ -1086,7 +1160,6 @@
             });
           }
           statusOverlay.textContent = "Pronto! Aguardando início sincronizado...";
-          // Se o filme já estava rodando (ex: entrou no meio da sessão), inicia direto
           if (currentSeekEpoch === 0 && shouldBePlaying) {
             statusOverlay.style.display = "none";
             playGuestVideoSafely();
@@ -1261,7 +1334,6 @@
       });
     }
 
-    // Escuta Play / Pause normal pelo Firestore (sem disparar reset de seek em loop)
     function listenToHostPlayback() {
       onSnapshot(doc(db, "salas", currentRoomId), (snap) => {
         if (!snap.exists()) return;
@@ -1269,9 +1341,12 @@
         const pb = data.playback;
         if (!pb) return;
 
+        if (data.onlineCount) {
+          viewersCount.textContent = `${data.onlineCount} online`;
+        }
+
         shouldBePlaying = pb.isPlaying;
 
-        // Se o Host está na barreira esperando o buffer, mantém pausado
         if (pb.buffering) {
           if (!videoEl.paused) videoEl.pause();
           return;
